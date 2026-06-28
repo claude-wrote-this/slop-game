@@ -3,7 +3,6 @@ from source.app import App
 from source.scenes.menu import MainMenuScene
 from source.utils import log
 
-
 def main():
     pygame.init()
     app = App()
