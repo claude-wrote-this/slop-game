@@ -1,6 +1,6 @@
-"""In-game scene. A camera over a chunked world: drag to pan, chunks stream in
-as they enter view. Generation lives in build_world; this scene receives a
-prebuilt WorldView (from the loading screen) or runs the same job inline.
+"""In-game scene: a camera over the screen-space renderer. Drag to pan; the
+renderer scrolls its oversized buffer and refills exposed strips. Generation
+lives in build_world; this scene receives a prebuilt world or runs it inline.
 """
 from source import config
 from source.scenes.base import Scene
@@ -24,10 +24,9 @@ class GameScene(Scene):
             except StopIteration as done:
                 world = done.value
 
-        self.world_view = world["world_view"]
-        self.terrain = world.get("terrain")
-        self.cam_x, self.cam_y = world.get(
-            "cam", (-(config.SCREEN_W // 2), -(config.SCREEN_H // 2)))
+        self.terrain = world["terrain"]
+        self.renderer = world["renderer"]
+        self.cam_x, self.cam_y = world["cam"]
         self._drag = None
 
         cx, w, h = config.SCREEN_W // 2, 240, 56
@@ -41,6 +40,7 @@ class GameScene(Scene):
         self._flash = 1.2
 
     def _menu(self):
+        self.renderer.shutdown()
         from source.scenes.menu import MainMenuScene
         self.app.set_root(MainMenuScene(self.app))
 
@@ -54,13 +54,12 @@ class GameScene(Scene):
         import pygame
         for b in self.buttons:
             b.handle_event(event)
-        # drag-to-pan, but don't start a drag on the buttons
         if event.type == pygame.MOUSEBUTTONDOWN and not self._on_button(event.pos):
             self._drag = event.pos
         elif event.type == pygame.MOUSEMOTION and self._drag is not None:
             dx = event.pos[0] - self._drag[0]
             dy = event.pos[1] - self._drag[1]
-            self.cam_x -= dx                      # grab-and-drag the map
+            self.cam_x -= dx                  # grab-and-drag the map
             self.cam_y -= dy
             self._drag = event.pos
         elif event.type == pygame.MOUSEBUTTONUP:
@@ -72,7 +71,9 @@ class GameScene(Scene):
             self._flash = max(0.0, self._flash - dt)
 
     def draw(self, surface):
-        self.world_view.draw(surface, self.cam_x, self.cam_y)
+        self.renderer.set_camera(self.cam_x, self.cam_y)
+        self.renderer.render()                # cheap: nothing within slack, else a strip
+        self.renderer.draw(surface)
         label = self.app.font_small.render(f"seed {self.state.seed}", True, config.TEXT)
         surface.blit(label, (12, 12))
         if self._flash > 0:
