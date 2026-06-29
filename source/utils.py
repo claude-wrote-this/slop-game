@@ -23,6 +23,7 @@ class SingletonLoggingHandler(metaclass=SingletonMeta):
 	def __init__(self, level=logging.DEBUG, file=None):
 		if file is None:
 			file = os.path.join(config.PROJECT_ROOT, f"logs/{config.TITLE}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
+		os.makedirs(os.path.dirname(file), exist_ok=True)
 		self._logger = logging.getLogger(f"{config.TITLE} Runtime Log")
 		self._logger.setLevel(level)
 		
