@@ -4,7 +4,7 @@ from source.scenes.base import Scene
 from source.scenes.game import GameScene
 from source.scenes.load import LoadScene
 from source.scenes.options import OptionsScene
-from source.ui.widgets import Button
+from source.ui.widgets import Button, ContinueButton
 from source.persistence import saves
 import pygame
 
@@ -23,7 +23,11 @@ class MainMenuScene(Scene):
             Button((cx - w // 2, top + i * (h + gap), w, h), text, cb, kind=kind, icon=icon, alpha=128)
             for i, (text, icon, cb, kind) in enumerate(labels)
         ]
-
+        cw = w +100
+        ch = 300
+        ctop = top - (ch+100)
+        #self.cbutton = ContinueButton((cx-cw// 2, ctop + h, cw, ch), "Test", lambda:None, kind="normal", alpha=128)
+       
     def _new(self):
 	    slug, state = saves.create_game("New World")
 	    from source.scenes.loading import LoadingScene
@@ -61,6 +65,7 @@ class MainMenuScene(Scene):
         bookend = pygame.image.load(config.BOOKEND_IMAGE)
         surface.blit(bookend, bookend.get_rect(center=(sub_rect.left - 25, sub_rect.centery+3)))
         surface.blit(bookend, bookend.get_rect(center=(sub_rect.right + 25, sub_rect.centery+3)))
+        #self.cbutton.draw(surface, self.app.font)
         for b in self.buttons:
             b.draw(surface, self.app.font)
         footer = pygame.image.load(config.FOOTER_IMAGE)

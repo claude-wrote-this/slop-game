@@ -1,8 +1,0 @@
-# Python
-__pycache__/
-*.py[cod]
-
-# Runtime artifacts
-logs/
-saves/
-settings.json
