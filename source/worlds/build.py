@@ -1,34 +1,37 @@
-"""World generation job for the loading screen. Builds the terrain and a
-WorldView, then pre-warms the chunks the spawn viewport covers — so the loading
-bar fills per chunk and the first frame has no hitch. Returns the WorldView and
-the spawn camera; GameScene just drives them.
-
-Tuning is the literal set used elsewhere; move into config during cleanup.
+"""World generation job for the loading screen. Builds terrain (pure data) and the
+streaming Renderer (whose worker thread starts filling immediately), points the
+camera at spawn, and waits for the worker to reveal the spawn viewport before
+handing control to the game. In-game, newly exposed areas clouds-clear on their
+own as the worker fills them.
 """
 from source import config
 from source.world.heightmap import TerrainHeight
-from source.world.worldview import WorldView
+from source.world.renderer import Renderer
 
-CHUNK_CELLS = getattr(config, "CHUNK_CELLS", 24)
+DENSITY = getattr(config, "RENDER_DENSITY", 0.055)
+OVERSIZE = getattr(config, "RENDER_OVERSIZE", 3)
 
 
 def build_world(seed):
     yield 0.0, "preparing"
 
     terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS)
-    wv = WorldView(terrain, chunk=CHUNK_CELLS, tile=config.TERRAIN_TILE,
-                   layers=config.TERRAIN_LAYERS,
-                   sun=(-1, -1), sun_slope=0.48,
-                   base=(108, 128, 90), haze=(48, 58, 78),
-                   haze_k=0.105, haze_max=0.60, shade_min=0.52)
+    renderer = Renderer(config.SCREEN_W, config.SCREEN_H, tile=config.TERRAIN_TILE,
+                        objects=[terrain], density=DENSITY, oversize=OVERSIZE)
 
-    # spawn camera: world (0,0) centred on screen
     cam_x = -(config.SCREEN_W // 2)
     cam_y = -(config.SCREEN_H // 2)
+    renderer.set_camera(cam_x, cam_y)
 
-    # pre-warm the spawn viewport, chunk by chunk, driving the progress bar
-    for done, total in wv.prewarm(cam_x, cam_y, config.SCREEN_W, config.SCREEN_H):
-        yield 0.1 + 0.85 * done / total, "shaping the land"
+    total = None
+    while True:                                    # worker fills spawn in parallel
+        rem = renderer.pending_points()
+        if rem > 0 and total is None:
+            total = rem
+        if total is not None and rem == 0:
+            break
+        prog = 0.1 if total is None else 0.1 + 0.85 * (1 - rem / total)
+        yield prog, "revealing the land"
 
     yield 1.0, "ready"
-    return {"world_view": wv, "cam": (cam_x, cam_y), "terrain": terrain}
+    return {"terrain": terrain, "renderer": renderer, "cam": (cam_x, cam_y)}
