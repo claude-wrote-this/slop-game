@@ -3,18 +3,11 @@ result on. It knows nothing about terrain: the job is a generator that yields
 (progress, label) and returns a result. World tuning lives wherever you build
 the job (config), never in here.
 
-Wiring (e.g. in menu New Game):
-
-    def job():
-        yield 0.0, "preparing"
-        field = Field(seed, ...)                 # params from config
-        yield 0.45, "shaping the land"
-        surf = render_chunk(field, ...)          # params from config
-        yield 1.0, "ready"
-        return {"field": field, "terrain_surf": surf}
+Wiring (see menu._new): build_world(seed) is the generator job; its return value
+is the built world handed to GameScene.
 
     self.app.set_root(LoadingScene(
-        self.app, job(),
+        self.app, build_world(state.seed),
         on_complete=lambda w: self.app.set_root(
             GameScene(self.app, slug, state, world=w))))
 """

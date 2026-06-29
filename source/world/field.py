@@ -1,13 +1,6 @@
-"""The 3D noise FIELD — shared source of truth for rendering and collision.
-
-Pure numpy, no pygame. One field answers three questions over arbitrary point
-ARRAYS (not a grid): value, solid, grad. The render 'rain' pass and the
-collision span test both call this same object, so they can never disagree about
-where the world is.
-
-3D (not a 2D heightmap) so the world isn't monotonic in z: a column can be solid
-high and air low, which is what gives overhangs, caves and floating layers for
-free instead of as special cases.
+"""The 3D Perlin noise primitive. Pure numpy, no pygame — vectorised over
+arbitrary point ARRAYS (not a grid). TerrainHeight builds the world's heightmap
+on top of this by sampling it at fixed z-slices.
 """
 import numpy as np
 
@@ -75,61 +68,3 @@ class _Perlin3:
         y1 = lerp(x1, x2, v)
         y2 = lerp(x3, x4, v)
         return lerp(y1, y2, w)                   # roughly [-1, 1]
-
-
-class Field:
-    """Configured 3D density field. density > 0 is solid, < 0 is air.
-
-    A vertical bias makes low z ground and high z air; the fBm noise carves that
-    plane into hills, banks, caves and overhangs. Surface height therefore comes
-    out of the noise rather than being stored.
-    """
-
-    def __init__(self, seed, *, xy_scale=0.06, z_scale=0.12, octaves=4,
-                 persistence=0.5, lacunarity=2.0, surface_z=3.0, z_bias=0.6):
-        self._noise = _Perlin3(seed)
-        self.xy_scale = xy_scale          # horizontal feature size (smaller = broader)
-        self.z_scale = z_scale            # vertical feature size (bigger = more overhangs)
-        self.octaves = octaves
-        self.persistence = persistence
-        self.lacunarity = lacunarity
-        self.surface_z = surface_z        # mean ground layer
-        self.z_bias = z_bias              # density cost per layer of height = "gravity"
-
-    def _fbm(self, x, y, z):
-        # Fractal sum: each octave adds finer, weaker detail. Normalised by the
-        # total amplitude so the result stays in roughly [-1, 1] regardless of
-        # octave count.
-        total, amp, freq, norm = 0.0, 1.0, 1.0, 0.0
-        for _ in range(self.octaves):
-            total = total + self._noise(np.asarray(x, float) * (self.xy_scale * freq),
-                                        np.asarray(y, float) * (self.xy_scale * freq),
-                                        np.asarray(z, float) * (self.z_scale * freq)) * amp
-            norm += amp
-            amp *= self.persistence       # each octave quieter
-            freq *= self.lacunarity       # each octave finer
-        return total / norm
-
-    def density(self, x, y, z):
-        # The bias term is what turns blobby 3D noise into terrain: it pulls
-        # density up low and down high, so a surface forms where noise ~= bias.
-        # Where the noise locally beats the bias, it folds back -> an overhang.
-        return self._fbm(x, y, z) + (self.surface_z - np.asarray(z, float)) * self.z_bias
-
-    # the three queries everything shares -----------------------------------
-    def value(self, x, y, z):
-        return self.density(x, y, z)
-
-    def solid(self, x, y, z, threshold=0.0):
-        return self.density(x, y, z) > threshold
-
-    def grad(self, x, y, z, eps=1e-2):
-        # Central differences: robust, and only the cold paths (contour-snapping,
-        # lighting normals) call it — rain and collision never do. Swap in
-        # Perlin's analytic derivative here if it ever shows up in a profile.
-        d = self.density
-        x = np.asarray(x, float); y = np.asarray(y, float); z = np.asarray(z, float)
-        gx = (d(x + eps, y, z) - d(x - eps, y, z)) / (2 * eps)
-        gy = (d(x, y + eps, z) - d(x, y - eps, z)) / (2 * eps)
-        gz = (d(x, y, z + eps) - d(x, y, z - eps)) / (2 * eps)
-        return gx, gy, gz

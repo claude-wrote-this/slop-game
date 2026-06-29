@@ -48,21 +48,7 @@ class Button:
         	surf.blit(self.icon, self.icon.get_rect(center=(self.rect.left+50, self.rect.centery)))
         img = font.render(self.label, True, config.TEXT)
         surf.blit(img, img.get_rect(center=self.rect.center))
-        
-class ContinueButton(Button):
-	def draw(self, surf, font):
-		base = _FILL[self.kind]
-		fill = tuple(min(255, c + 18) for c in base) if self._down else base
-		edge = config.DANGER if self.kind == "danger" else config.ACCENT
-		panel = pygame.Surface(self.rect.size, pygame.SRCALPHA)   # per-pixel alpha
-		local = panel.get_rect()
-		pygame.draw.rect(panel, (*fill, self.alpha), local, border_radius=10)
-		pygame.draw.rect(panel, (*edge, min(255, self.alpha +55)), local, width=2, border_radius=10)
-		surf.blit(panel, self.rect.topleft)
-		if self.icon is not None:
-		      surf.blit(self.icon, self.icon.get_rect(center=(self.rect.left+50, self.rect.centery)))
-		img = font.render(self.label, True, config.TEXT)
-		surf.blit(img, (self.rect.left+10, self.rect.top+10))
+
 
 class Dropdown:
     def __init__(self, rect, options, index, on_select, *, label_fn=str,
