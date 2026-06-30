@@ -8,11 +8,13 @@ TEST HARNESS for pan/zoom. Three stages, renderer -> buffer -> screen:
     currently inside the screen area — the draw list. Re-culling against the view
     is the "screen-space" work, kept off the main thread. (It could go further and
     track only points entering/leaving the screen incrementally; not needed yet.)
-  * Screen (main thread): each frame draws the cloud, blits the buffer's draw list
-    (transformed with the live camera), and the scene paints UI on top. The main
-    loop then flips. Drawing + flip on one thread per frame = no torn/flashing
-    frames; the buffer is points, never a surface, so there are no SDL surface
-    locks to fight.
+  * Screen (main thread): the settled points are cached on a screen-size terrain
+    layer that is REPROJECTED each frame rather than re-blitting every point —
+    scrolled for pan (refilling only the exposed edge strips) and scaled for zoom,
+    rebuilt only when the view drifts too far. Each frame: cloud, the layer, then
+    the fading points fresh on top (they change every frame), then UI; the main
+    loop flips. The layer is screen-size and main-thread-only — never an oversized
+    read-from buffer and no cross-thread surface, so no SDL locks to fight.
 
 The terrain function (TerrainHeight) and the cloud background are untouched.
 """
@@ -105,6 +107,17 @@ class Renderer:
         self._solid = {}                # colour key -> opaque colorkey circle (settled)
         self._fade = {}                 # (colour key, progress level) -> SRCALPHA kernel
         self._FADE_LEVELS = 6           # quantise fade progress so kernels cache
+
+        # --- terrain layer: a screen-size colorkey cache of the SETTLED points.
+        #     Reprojected each frame instead of re-blitting every point — scrolled
+        #     for pan (refilling only exposed edge strips) and scaled for zoom,
+        #     rebuilt only when the view drifts too far. Screen-size, never an
+        #     oversized read-from buffer; only the main thread touches it.
+        self._layer = None
+        self._layer_cam = (0.0, 0.0)    # world top-left the layer is aligned to
+        self._layer_zoom = 1.0          # zoom the layer was rendered at
+        self._prev_zoom = 1.0           # last frame's zoom (to detect zoom settle)
+        self._prev_now = time.monotonic()
 
         # --- cloud background (untouched) ---
         self.cloud = cloud
@@ -246,35 +259,129 @@ class Renderer:
                  special_flags=pygame.BLEND_RGBA_MULT)     # tint + scale alpha
         return ker, r2
 
+    # --- terrain layer: cache settled points, reproject instead of re-blitting --
+    def _new_layer(self):
+        s = pygame.Surface((self.w, self.h))
+        try:
+            s = s.convert()
+        except pygame.error:
+            pass
+        s.fill(_CKEY)
+        s.set_colorkey(_CKEY)             # plain colorkey (modified each frame -> no RLE)
+        return s
+
+    def _screen_xy(self, pts, cam, zoom):
+        cx = cam[0] + self.w * 0.5
+        cy = cam[1] + self.h * 0.5
+        return (self.w * 0.5 + (pts[:, 0] - cx) * zoom,
+                self.h * 0.5 + (pts[:, 1] - cy) * zoom)
+
+    def _rebuild_layer(self, pts, cols, comp, now, cam, zoom):
+        """Full re-render of the visible settled points onto the layer."""
+        self._layer.fill(_CKEY)
+        if pts.shape[0]:
+            sx, sy = self._screen_xy(pts, cam, zoom)
+            settled = now >= comp
+            if settled.any():
+                self._blit_settled(self._layer, sx[settled], sy[settled],
+                                   self._colour_keys(cols)[settled], self._scaled_r)
+        self._layer_cam = cam
+        self._layer_zoom = zoom
+
+    def _scroll_layer(self, pts, cols, comp, now, cam, zoom):
+        """Pan: shift the layer to the new camera, refilling only the exposed edge
+        strips from the point store. Gap-free and screen-size — no oversize buffer."""
+        L = self._layer
+        lcx, lcy = self._layer_cam
+        ddx = int(round((lcx - cam[0]) * zoom))
+        ddy = int(round((lcy - cam[1]) * zoom))
+        if ddx == 0 and ddy == 0:
+            return                                   # sub-pixel drift; still aligned
+        if abs(ddx) >= self.w or abs(ddy) >= self.h:
+            self._rebuild_layer(pts, cols, comp, now, cam, zoom)   # teleport
+            return
+        L.scroll(ddx, ddy)
+        self._layer_cam = (lcx - ddx / zoom, lcy - ddy / zoom)
+        if not pts.shape[0]:
+            return
+        sx, sy = self._screen_xy(pts, cam, zoom)
+        settled = now >= comp
+        keys = self._colour_keys(cols)
+        r = self._scaled_r
+
+        def strip(x0, x1, y0, y1):                   # clear + refill one exposed band
+            L.fill(_CKEY, (x0, y0, x1 - x0, y1 - y0))
+            m = settled & (sx >= x0 - r) & (sx < x1 + r) & (sy >= y0 - r) & (sy < y1 + r)
+            if m.any():
+                self._blit_settled(L, sx[m], sy[m], keys[m], r)
+
+        if ddx > 0:   strip(0, ddx, 0, self.h)              # exposed on the left
+        elif ddx < 0: strip(self.w + ddx, self.w, 0, self.h)
+        if ddy > 0:   strip(0, self.w, 0, ddy)              # exposed on the top
+        elif ddy < 0: strip(0, self.w, self.h + ddy, self.h)
+
+    def _commit_settles(self, pts, cols, comp, now, cam, zoom):
+        """Stamp points that crossed completion since last frame onto the layer,
+        so freshly-settled points appear without waiting for a rebuild."""
+        if not pts.shape[0]:
+            return
+        just = (comp > self._prev_now) & (comp <= now)
+        if not just.any():
+            return
+        sx, sy = self._screen_xy(pts, cam, zoom)
+        self._blit_settled(self._layer, sx[just], sy[just],
+                           self._colour_keys(cols)[just], self._scaled_r)
+
+    def _reproject(self, target, cam, zoom):
+        """Active zoom: display the cached layer scaled (nearest) + offset, no
+        re-blit. Blocky while zooming; a crisp rebuild lands when zoom settles."""
+        L = self._layer
+        scale = zoom / self._layer_zoom
+        lcx, lcy = self._layer_cam
+        ox = self.w * 0.5 + (lcx - cam[0]) * zoom    # screen pos of the layer centre
+        oy = self.h * 0.5 + (lcy - cam[1]) * zoom
+        sw = max(1, int(round(self.w * scale)))
+        sh = max(1, int(round(self.h * scale)))
+        scaled = pygame.transform.scale(L, (sw, sh))
+        scaled.set_colorkey(_CKEY)
+        target.blit(scaled, (int(ox - sw * 0.5), int(oy - sh * 0.5)))
+
     def draw(self, target):
-        cam_x, cam_y = self._cam
+        cam = self._cam
+        zoom = self.zoom
         if self.cloud:
-            self._cloud_background(target, cam_x, cam_y)
+            self._cloud_background(target, cam[0], cam[1])
         else:
             target.fill(self.bg)
 
         with self._lock:                  # O(1) grab of the latest draw list
             pts, cols, comp = self._draw_list
+        now = time.monotonic()
+        self._ensure_kernels(zoom)
 
+        if self._layer is None:                                   # first frame
+            self._layer = self._new_layer()
+            self._rebuild_layer(pts, cols, comp, now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        elif zoom == self._layer_zoom:                            # pan / static
+            self._scroll_layer(pts, cols, comp, now, cam, zoom)
+            self._commit_settles(pts, cols, comp, now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        elif zoom == self._prev_zoom:                             # zoom settled
+            self._rebuild_layer(pts, cols, comp, now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        else:                                                     # active zoom
+            self._reproject(target, cam, zoom)
+
+        # fading points change every frame (can't be cached) -> drawn fresh on top
         if pts.shape[0]:
-            now = time.monotonic()
-            zoom = self.zoom
-            self._ensure_kernels(zoom)
-            r = self._scaled_r
-            cx = cam_x + self.w * 0.5
-            cy = cam_y + self.h * 0.5
-            # transform the SMALL draw list with the live camera -> exact alignment
-            sx = self.w * 0.5 + (pts[:, 0] - cx) * zoom
-            sy = self.h * 0.5 + (pts[:, 1] - cy) * zoom
-            keys = self._colour_keys(cols)
-
-            settled = now >= comp        # one cheap comparison; the vast majority
-            if settled.any():
-                self._blit_settled(target, sx[settled], sy[settled], keys[settled], r)
-            fading = ~settled
+            fading = now < comp
             if fading.any():
-                self._blit_fading(target, sx[fading], sy[fading], keys[fading],
-                                  comp[fading], now)
+                sx, sy = self._screen_xy(pts, cam, zoom)
+                self._blit_fading(target, sx[fading], sy[fading],
+                                  self._colour_keys(cols)[fading], comp[fading], now)
 
+        self._prev_zoom = zoom
+        self._prev_now = now
         if self.cloud:
             self.cloud_t += 1.0
