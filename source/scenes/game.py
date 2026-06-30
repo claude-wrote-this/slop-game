@@ -45,17 +45,8 @@ class GameScene(Scene):
             Button((cx - w // 2, config.SCREEN_H - 86, w, h), "Menu", self._menu, kind="ghost"),
         ]
 
-    # The renderer owns the whole frame on its own thread; this scene only
-    # feeds it the camera and an overlay. App.run must NOT draw/flip us.
-    self_render = True
-
-    def on_enter(self):
-        self.renderer.set_camera(self.cam_x, self.cam_y)
-        self.renderer.set_zoom(self.zoom)
-        self.renderer.start(self.app.screen, self._draw_overlay)
-
     def on_exit(self):
-        self.renderer.shutdown()           # stop the render thread first
+        self.renderer.shutdown()           # stop the buffer thread first
         saves.save_game(self.slug, self.state)
 
     def _save(self):
@@ -154,12 +145,13 @@ class GameScene(Scene):
         self.state.tick += 1
         if self._flash > 0:
             self._flash = max(0.0, self._flash - dt)
-        # push the latest view to the render thread (cheap; no drawing here)
+
+    def draw(self, surface):
+        # Main thread: feed the view to the buffer, then draw the cloud + the
+        # buffer's draw list + UI as one frame (App flips after) — no flashing.
         self.renderer.set_camera(self.cam_x, self.cam_y)
         self.renderer.set_zoom(self.zoom)
-
-    def _draw_overlay(self, surface):
-        """Painted by the render thread each frame, on top of the terrain."""
+        self.renderer.draw(surface)
         label = self.app.font_small.render(f"seed {self.state.seed}", True, config.TEXT)
         surface.blit(label, (12, 12))
         if self._flash > 0:
