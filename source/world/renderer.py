@@ -1,20 +1,25 @@
 """Static point-cloud terrain renderer over a drifting cloud background.
 
-TEST HARNESS (deliberately minimal): the renderer holds a STATIC set of
-world-space points and draws them through a movable, zoomable view. There is no
-generation worker, no sampler, no buffering — the point of this version is to
-isolate and measure pan/zoom on a fixed point set.
+TEST HARNESS for pan/zoom. A fixed set of world-space points is sampled ONCE
+from the terrain function; the work then splits across two threads:
 
-  * A fixed world-space `area` is sampled once at construction with
-    n = density * area points (random positions + a legible banded colour).
-  * The view is a world center + zoom. Pan moves the center; zoom is a draw-time
-    world->screen scale only. Soft/blurry when zoomed in is expected.
+  * Buffer thread (the "filter"): repeatedly culls the full static point set down
+    to just what the current view can see and publishes that small visible subset
+    (world coords + colour). All numpy, no pygame. This is the expensive O(all
+    points) pass, kept off the main thread.
+  * Main thread (pan / zoom / draw only): reads input into the view (world center
+    + zoom), grabs the latest published subset, transforms that SMALL set with the
+    live camera (so it's always exactly aligned) and blits it over the cloud.
 
-The previous elastic-kernel generator, its sampler dependency, and the triple
-buffer were removed: the sampler was the wrong model and, with static data, the
-buffer guards nothing. Generation will come back later against the real sampler;
-the cloud background is kept untouched as the backdrop the points sit over.
+So the heavy filter scales with the whole point set but runs on the buffer thread,
+while the main thread only ever touches what's on screen. The terrain function
+(TerrainHeight) is the thing being sampled and is untouched; only the sampling
+STRATEGY here is the static stand-in for real generation. The cloud background is
+also untouched.
 """
+import threading
+import time
+
 import numpy as np
 import pygame
 
@@ -49,14 +54,16 @@ def _make_cloud_tex(size, seed):
 
 
 class Renderer:
-    def __init__(self, screen_w, screen_h, *, tile=16, density=0.008, area=None,
-                 seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
+    def __init__(self, screen_w, screen_h, *, terrain, tile=16, density=0.008,
+                 area=None, seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85, fade=200):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.bg = bg
 
-        # --- static point set: n = density * area, sampled once ---------------
+        # --- static point set: n = density * area, sampled once through the
+        #     terrain function for colour (the function is the food; this random
+        #     scatter is the sampler standing in for real generation) ----------
         aw, ah = area if area else (4 * self.w, 4 * self.h)
         self.area = (aw, ah)
         self.density = density
@@ -65,17 +72,19 @@ class Renderer:
         px = rng.uniform(-aw / 2, aw / 2, n)        # world-space, centered on origin
         py = rng.uniform(-ah / 2, ah / 2, n)
         self.points = np.stack([px, py], axis=1)
-        # a legible low-frequency band so pan/zoom is visually meaningful
-        t = 0.5 + 0.5 * np.sin(px * 0.012) * np.cos(py * 0.012)
-        lo = np.array([90, 120, 80], float); hi = np.array([170, 180, 140], float)
-        self.colours = (lo * (1 - t)[:, None] + hi * t[:, None]).astype(np.uint8)
+        _, colour = terrain.sample_points(px / tile, py / tile)
+        self.colours = np.ascontiguousarray(colour, dtype=np.uint8)
         self.n = n
 
-        # --- view (main thread) ---
+        # --- view (main thread writes, buffer thread reads) ---
         self.cam_x = 0.0          # world-space top-left of the view at zoom 1
         self.cam_y = 0.0
         self.zoom = 1.0
         # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0   # clamp — needed eventually (scene side)
+
+        # --- the buffer: latest visible subset published by the filter thread ---
+        self._ready = (self.points[:0], self.colours[:0])
+        self._lock = threading.Lock()
 
         # --- draw kernels (main thread only) ---
         self.radius = max(1, int(tile * 0.95))
@@ -95,7 +104,11 @@ class Renderer:
             self.cloud_t = 0.0
             self._cloud_surf = pygame.Surface((self.w, self.h))
 
-    # --- view API ---------------------------------------------------------
+        self._running = True
+        self._worker = threading.Thread(target=self._filter, name="buffer", daemon=True)
+        self._worker.start()
+
+    # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
         self.cam_x, self.cam_y = float(x), float(y)
 
@@ -106,12 +119,29 @@ class Renderer:
         return 0                          # static: nothing to wait for
 
     def render(self):
-        pass                              # nothing to generate
+        pass                              # the filter runs on the buffer thread
 
-    def shutdown(self):
-        pass                              # no worker to stop
+    # --- buffer thread: cull the full set to the visible subset -----------
+    def _filter(self):
+        last = None
+        while self._running:
+            cam_x, cam_y, zoom = self.cam_x, self.cam_y, self.zoom
+            key = (cam_x, cam_y, zoom)
+            if key == last:               # view unchanged -> nothing to refilter
+                time.sleep(0.004)
+                continue
+            last = key
+            cx = cam_x + self.w * 0.5
+            cy = cam_y + self.h * 0.5
+            sx = self.w * 0.5 + (self.points[:, 0] - cx) * zoom
+            sy = self.h * 0.5 + (self.points[:, 1] - cy) * zoom
+            m = self.radius * zoom + 1.0  # margin: a kernel straddling the edge
+            on = (sx > -m) & (sx < self.w + m) & (sy > -m) & (sy < self.h + m)
+            subset = (self.points[on], self.colours[on])
+            with self._lock:              # publish: a tiny ref swap
+                self._ready = subset
 
-    # --- draw -------------------------------------------------------------
+    # --- main thread: transform the small visible subset and blit ---------
     def _ensure_kernels(self, zoom):
         zb = round(zoom, 2)
         if zb == self._zoom_bucket:
@@ -148,37 +178,41 @@ class Renderer:
         else:
             target.fill(self.bg)
 
-        zoom = self.zoom
-        self._ensure_kernels(zoom)
-        r = self._scaled_r
-        cx = self.cam_x + self.w * 0.5
-        cy = self.cam_y + self.h * 0.5
-        # world -> screen: translate by view center, scale by zoom, re-center
-        sx = self.w * 0.5 + (self.points[:, 0] - cx) * zoom
-        sy = self.h * 0.5 + (self.points[:, 1] - cy) * zoom
-        on = (sx > -r) & (sx < self.w + r) & (sy > -r) & (sy < self.h + r)
+        with self._lock:                  # O(1) grab of the latest visible subset
+            pts, cols = self._ready
 
-        # to python lists once: per-point numpy scalar access is the slow path
-        xs = (sx[on] - r).astype(np.int32).tolist()
-        ys = (sy[on] - r).astype(np.int32).tolist()
-        cb = self.colours[on] & 0xF8                  # bucket colours (vectorised)
-        keys = ((cb[:, 0].astype(np.uint32) << 16)
-                | (cb[:, 1].astype(np.uint32) << 8)
-                | cb[:, 2].astype(np.uint32)).tolist()
-
-        base, cache = self._scaled_base, self._tint
-        seq = []
-        for i in range(len(xs)):
-            k = keys[i]
-            ker = cache.get(k)
-            if ker is None:
-                ker = base.copy()
-                ker.fill((k >> 16, (k >> 8) & 0xFF, k & 0xFF, 255),
-                         special_flags=pygame.BLEND_RGBA_MULT)
-                cache[k] = ker
-            seq.append((ker, (xs[i], ys[i])))
-        if seq:
-            target.blits(seq, doreturn=False)
+        if pts.shape[0]:
+            zoom = self.zoom
+            self._ensure_kernels(zoom)
+            r = self._scaled_r
+            cx = self.cam_x + self.w * 0.5
+            cy = self.cam_y + self.h * 0.5
+            # transform the SMALL subset with the live camera -> exact alignment
+            sx = (self.w * 0.5 + (pts[:, 0] - cx) * zoom - r).astype(np.int32).tolist()
+            sy = (self.h * 0.5 + (pts[:, 1] - cy) * zoom - r).astype(np.int32).tolist()
+            cb = cols & 0xF8                                  # bucket colours
+            keys = ((cb[:, 0].astype(np.uint32) << 16)
+                    | (cb[:, 1].astype(np.uint32) << 8)
+                    | cb[:, 2].astype(np.uint32)).tolist()
+            base, cache = self._scaled_base, self._tint
+            seq = []
+            for i in range(len(sx)):
+                k = keys[i]
+                ker = cache.get(k)
+                if ker is None:
+                    ker = base.copy()
+                    ker.fill((k >> 16, (k >> 8) & 0xFF, k & 0xFF, 255),
+                             special_flags=pygame.BLEND_RGBA_MULT)
+                    cache[k] = ker
+                seq.append((ker, (sx[i], sy[i])))
+            if seq:
+                target.blits(seq, doreturn=False)
 
         if self.cloud:
             self.cloud_t += 1.0
+
+    def shutdown(self):
+        self._running = False
+        if self._worker is not None:
+            self._worker.join(timeout=1.0)
+            self._worker = None
