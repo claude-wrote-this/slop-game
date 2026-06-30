@@ -55,7 +55,8 @@ def _make_cloud_tex(size, seed):
 class Renderer:
     def __init__(self, screen_w, screen_h, *, terrain, tile=16, density=0.008,
                  area=None, seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
-                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85, fade=200):
+                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85, fade=200,
+                 fade_duration=0.6, fade_jitter=0.5):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.bg = bg
@@ -71,6 +72,13 @@ class Renderer:
         self.points = np.stack([px, py], axis=1)
         _, colour = terrain.sample_points(px / tile, py / tile)
         self.colours = np.ascontiguousarray(colour, dtype=np.uint8)
+        # Per-point fade-in: immutable completion stamp set at generation time
+        # (here, construction). completion = now + duration + per-point jitter so a
+        # burst doesn't fade in lockstep. Rides through the buffer untouched; main
+        # only ever reads it. duration is the denominator for fade progress.
+        self.fade_duration = fade_duration
+        self.completion = (time.monotonic() + fade_duration
+                           + rng.uniform(0.0, fade_jitter, n))
         self.n = n
 
         # --- view: main thread writes, buffer thread reads --------------------
@@ -80,7 +88,7 @@ class Renderer:
 
         # --- buffer: the maintained draw list (visible subset) ----------------
         self.radius = max(1, int(tile * 0.95))
-        self._draw_list = (self.points[:0], self.colours[:0])
+        self._draw_list = (self.points[:0], self.colours[:0], self.completion[:0])
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._buffer_loop, name="buffer",
@@ -92,7 +100,9 @@ class Renderer:
         self._zoom_bucket = None
         self._scaled_base = self._base_kernel
         self._scaled_r = self.radius
-        self._tint = {}                 # colour key -> tinted scaled kernel
+        self._tint = {}                 # colour key -> tinted scaled kernel (settled)
+        self._fade = {}                 # (colour key, progress level) -> faded kernel
+        self._FADE_LEVELS = 6           # quantise fade progress so kernels cache
 
         # --- cloud background (untouched) ---
         self.cloud = cloud
@@ -139,7 +149,7 @@ class Renderer:
             sy = self.h * 0.5 + (self.points[:, 1] - cy) * zoom
             m = self.radius * zoom + 1.0  # margin: a kernel straddling the edge
             on = (sx > -m) & (sx < self.w + m) & (sy > -m) & (sy < self.h + m)
-            subset = (self.points[on], self.colours[on])
+            subset = (self.points[on], self.colours[on], self.completion[on])
             with self._lock:              # publish: a tiny ref swap
                 self._draw_list = subset
 
@@ -155,6 +165,7 @@ class Renderer:
         self._scaled_base = (self._base_kernel if r == self.radius
                              else pygame.transform.smoothscale(self._base_kernel, (d, d)))
         self._tint = {}                   # colours must be re-tinted at the new size
+        self._fade = {}                   # ...and the faded kernels rescaled
 
     def _cloud_background(self, target, cam_x, cam_y):
         size = self.cloud_tex.shape[0]
@@ -174,6 +185,63 @@ class Renderer:
         del rgb
         target.blit(self._cloud_surf, (0, 0))
 
+    @staticmethod
+    def _colour_keys(cols):
+        cb = cols & 0xF8                              # bucket colours -> packed int
+        return ((cb[:, 0].astype(np.uint32) << 16)
+                | (cb[:, 1].astype(np.uint32) << 8)
+                | cb[:, 2].astype(np.uint32))
+
+    def _blit_settled(self, target, sx, sy, keys, r):
+        """Full size, full opacity, batched. The hot path — most points, every
+        frame — so it stays a single blits() with cached tinted kernels."""
+        xs = (sx - r).astype(np.int32).tolist()
+        ys = (sy - r).astype(np.int32).tolist()
+        keys = keys.tolist()
+        base, cache = self._scaled_base, self._tint
+        seq = []
+        for i in range(len(xs)):
+            k = keys[i]
+            ker = cache.get(k)
+            if ker is None:
+                ker = base.copy()
+                ker.fill((k >> 16, (k >> 8) & 0xFF, k & 0xFF, 255),
+                         special_flags=pygame.BLEND_RGBA_MULT)
+                cache[k] = ker
+            seq.append((ker, (xs[i], ys[i])))
+        if seq:
+            target.blits(seq, doreturn=False)
+
+    def _blit_fading(self, target, sx, sy, keys, comp, now):
+        """The fading minority: grow 0->full and fade transparent->opaque with
+        progress. Per-point scale+alpha, but kernels cache by (colour, progress
+        level) so a burst fading together stays cheap."""
+        prog = np.clip(1.0 - (comp - now) / self.fade_duration, 0.0, 1.0)
+        lv = (prog * self._FADE_LEVELS).astype(np.int32)   # quantise 0..LEVELS
+        xs = sx.tolist(); ys = sy.tolist()
+        keys = keys.tolist(); lv = lv.tolist()
+        cache = self._fade
+        for i in range(len(xs)):
+            p = lv[i]
+            if p <= 0:                       # still essentially invisible
+                continue
+            ck = keys[i]
+            ent = cache.get((ck, p))
+            if ent is None:
+                ent = self._make_fade_kernel(ck, p)
+                cache[(ck, p)] = ent
+            ker, kr = ent
+            target.blit(ker, (int(xs[i]) - kr, int(ys[i]) - kr))
+
+    def _make_fade_kernel(self, ck, level):
+        frac = level / self._FADE_LEVELS                   # (0, 1]
+        full = self._scaled_r * 2 + 1
+        size = max(1, int(round(full * frac)))
+        ker = pygame.transform.smoothscale(self._scaled_base, (size, size))
+        ker.fill((ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF, int(255 * frac)),
+                 special_flags=pygame.BLEND_RGBA_MULT)     # tint + scale alpha
+        return ker, size // 2
+
     def draw(self, target):
         cam_x, cam_y = self._cam
         if self.cloud:
@@ -182,34 +250,27 @@ class Renderer:
             target.fill(self.bg)
 
         with self._lock:                  # O(1) grab of the latest draw list
-            pts, cols = self._draw_list
+            pts, cols, comp = self._draw_list
 
         if pts.shape[0]:
+            now = time.monotonic()
             zoom = self.zoom
             self._ensure_kernels(zoom)
             r = self._scaled_r
             cx = cam_x + self.w * 0.5
             cy = cam_y + self.h * 0.5
             # transform the SMALL draw list with the live camera -> exact alignment
-            sx = (self.w * 0.5 + (pts[:, 0] - cx) * zoom - r).astype(np.int32).tolist()
-            sy = (self.h * 0.5 + (pts[:, 1] - cy) * zoom - r).astype(np.int32).tolist()
-            cb = cols & 0xF8                              # bucket colours
-            keys = ((cb[:, 0].astype(np.uint32) << 16)
-                    | (cb[:, 1].astype(np.uint32) << 8)
-                    | cb[:, 2].astype(np.uint32)).tolist()
-            base, cache = self._scaled_base, self._tint
-            seq = []
-            for i in range(len(sx)):
-                k = keys[i]
-                ker = cache.get(k)
-                if ker is None:
-                    ker = base.copy()
-                    ker.fill((k >> 16, (k >> 8) & 0xFF, k & 0xFF, 255),
-                             special_flags=pygame.BLEND_RGBA_MULT)
-                    cache[k] = ker
-                seq.append((ker, (sx[i], sy[i])))
-            if seq:
-                target.blits(seq, doreturn=False)
+            sx = self.w * 0.5 + (pts[:, 0] - cx) * zoom
+            sy = self.h * 0.5 + (pts[:, 1] - cy) * zoom
+            keys = self._colour_keys(cols)
+
+            settled = now >= comp        # one cheap comparison; the vast majority
+            if settled.any():
+                self._blit_settled(target, sx[settled], sy[settled], keys[settled], r)
+            fading = ~settled
+            if fading.any():
+                self._blit_fading(target, sx[fading], sy[fading], keys[fading],
+                                  comp[fading], now)
 
         if self.cloud:
             self.cloud_t += 1.0
