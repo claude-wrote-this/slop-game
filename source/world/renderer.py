@@ -23,12 +23,13 @@ import numpy as np
 import pygame
 
 
-def _make_kernel(radius, peak):
-    # soft, semi-transparent disc; tinted per point colour at draw time.
+def _make_kernel(radius):
+    # solid filled circle: full alpha inside, ~1px antialiased edge (not a blur).
+    # tinted per point colour at draw time.
     d = radius * 2 + 1
     yy, xx = np.mgrid[0:d, 0:d]
-    dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2) / max(1, radius)
-    alpha = (np.clip(1 - dist, 0, 1) ** 1.5 * peak).astype(np.uint8)
+    dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2)
+    alpha = (np.clip(radius + 0.5 - dist, 0.0, 1.0) * 255).astype(np.uint8)
     surf = pygame.Surface((d, d), pygame.SRCALPHA)
     surf.fill((255, 255, 255, 0))
     a = pygame.surfarray.pixels_alpha(surf)
@@ -55,7 +56,7 @@ def _make_cloud_tex(size, seed):
 class Renderer:
     def __init__(self, screen_w, screen_h, *, terrain, tile=16, density=0.008,
                  area=None, seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
-                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85, fade=200,
+                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
                  fade_duration=0.6, fade_jitter=0.5):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
@@ -96,7 +97,7 @@ class Renderer:
         self._thread.start()
 
         # --- draw kernels (main thread only) ---
-        self._base_kernel = _make_kernel(self.radius, fade)
+        self._base_kernel = _make_kernel(self.radius)
         self._zoom_bucket = None
         self._scaled_base = self._base_kernel
         self._scaled_r = self.radius
@@ -160,12 +161,12 @@ class Renderer:
             return
         self._zoom_bucket = zb
         r = max(1, int(round(self.radius * zoom)))
-        d = r * 2 + 1
         self._scaled_r = r
-        self._scaled_base = (self._base_kernel if r == self.radius
-                             else pygame.transform.smoothscale(self._base_kernel, (d, d)))
+        # regenerate the circle crisply at the new radius (don't smooth-scale a
+        # small one up — that's what reads as blur when zoomed in)
+        self._scaled_base = self._base_kernel if r == self.radius else _make_kernel(r)
         self._tint = {}                   # colours must be re-tinted at the new size
-        self._fade = {}                   # ...and the faded kernels rescaled
+        self._fade = {}                   # ...and the faded kernels rebuilt
 
     def _cloud_background(self, target, cam_x, cam_y):
         size = self.cloud_tex.shape[0]
@@ -235,12 +236,11 @@ class Renderer:
 
     def _make_fade_kernel(self, ck, level):
         frac = level / self._FADE_LEVELS                   # (0, 1]
-        full = self._scaled_r * 2 + 1
-        size = max(1, int(round(full * frac)))
-        ker = pygame.transform.smoothscale(self._scaled_base, (size, size))
+        r2 = max(1, int(round(self._scaled_r * frac)))     # grow 0 -> full radius
+        ker = _make_kernel(r2)                             # crisp solid circle
         ker.fill((ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF, int(255 * frac)),
                  special_flags=pygame.BLEND_RGBA_MULT)     # tint + scale alpha
-        return ker, size // 2
+        return ker, r2
 
     def draw(self, target):
         cam_x, cam_y = self._cam
