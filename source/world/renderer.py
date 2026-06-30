@@ -4,12 +4,12 @@ TEST HARNESS for pan/zoom. A fixed set of world-space points is sampled ONCE fro
 the terrain function. The key design point: ALL screen-space work runs on a
 dedicated render thread, never the main thread.
 
-  * Render thread (owns the whole frame): reads the camera + the world-space point
-    arrays, draws the cloud, culls/transforms/blits the visible points and the UI
-    overlay, and flips the display. It owns the display surface end to end.
-  * Main thread: only pumps input and updates the camera (set_camera/set_zoom).
-    It never touches a surface, so the render thread never fights it for an SDL
-    surface lock.
+  * Render thread (does all the blitting): reads the camera + the world-space
+    point arrays and blits the whole frame — cloud, culled/transformed visible
+    points, UI overlay — onto the display surface. It does NOT flip.
+  * Main thread: pumps input, updates the camera (set_camera/set_zoom), and calls
+    pygame.display.flip() to present. flip must stay on the main thread; blitting
+    does not, which is the whole point.
 
 Cross-thread state is just the point arrays (read-only here; numpy, not surfaces)
 and the camera (a tuple + a float). There is deliberately NO inter-thread buffer
@@ -121,9 +121,10 @@ class Renderer:
 
     # --- render thread ----------------------------------------------------
     def start(self, screen, overlay=None):
-        """Hand the display surface to a render thread. `overlay(target)` is
-        called each frame after the terrain to paint UI (also off the main
-        thread). Idempotent-ish: call once when the scene becomes active."""
+        """Hand the display surface to a render thread that blits into it.
+        `overlay(target)` is called each frame after the terrain to paint UI (also
+        off the main thread). The main loop still owns flip(). Call once when the
+        scene becomes active."""
         self._screen = screen
         self._overlay = overlay
         self._running = True
@@ -139,8 +140,7 @@ class Renderer:
     def _loop(self):
         clock = pygame.time.Clock()
         while self._running:
-            self.draw(self._screen)
-            pygame.display.flip()
+            self.draw(self._screen)       # blit only; the main loop flips
             clock.tick(self.fps)
 
     # --- drawing (render thread) ------------------------------------------
