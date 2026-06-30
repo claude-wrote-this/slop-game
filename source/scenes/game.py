@@ -45,6 +45,19 @@ class GameScene(Scene):
             Button((cx - w // 2, config.SCREEN_H - 86, w, h), "Menu", self._menu, kind="ghost"),
         ]
 
+    # The renderer owns the whole frame on its own thread; this scene only
+    # feeds it the camera and an overlay. App.run must NOT draw/flip us.
+    self_render = True
+
+    def on_enter(self):
+        self.renderer.set_camera(self.cam_x, self.cam_y)
+        self.renderer.set_zoom(self.zoom)
+        self.renderer.start(self.app.screen, self._draw_overlay)
+
+    def on_exit(self):
+        self.renderer.shutdown()           # stop the render thread first
+        saves.save_game(self.slug, self.state)
+
     def _save(self):
         saves.save_game(self.slug, self.state)
         self._flash = 1.2
@@ -53,9 +66,6 @@ class GameScene(Scene):
         self.renderer.shutdown()
         from source.scenes.menu import MainMenuScene
         self.app.set_root(MainMenuScene(self.app))
-
-    def on_exit(self):
-        saves.save_game(self.slug, self.state)
 
     def _on_button(self, pos):
         return any(b.rect.collidepoint(pos) for b in self.buttons)
@@ -144,12 +154,12 @@ class GameScene(Scene):
         self.state.tick += 1
         if self._flash > 0:
             self._flash = max(0.0, self._flash - dt)
-
-    def draw(self, surface):
+        # push the latest view to the render thread (cheap; no drawing here)
         self.renderer.set_camera(self.cam_x, self.cam_y)
         self.renderer.set_zoom(self.zoom)
-        self.renderer.render()                # no-op: all generation is on the worker
-        self.renderer.draw(surface)
+
+    def _draw_overlay(self, surface):
+        """Painted by the render thread each frame, on top of the terrain."""
         label = self.app.font_small.render(f"seed {self.state.seed}", True, config.TEXT)
         surface.blit(label, (12, 12))
         if self._flash > 0:

@@ -105,9 +105,14 @@ class App:
             if not self.running or not self.scene:
                 break
             self.scene.update(dt)
-            self.scene.draw(self.screen)
-            pygame.display.flip()
+            # A self_render scene owns its own render thread (drawing + flip);
+            # the main loop must not touch the display for it.
+            if not getattr(self.scene, "self_render", False):
+                self.scene.draw(self.screen)
+                pygame.display.flip()
             frames += 1
             if max_frames and frames >= max_frames:
                 break
+        while self._stack:                 # fire on_exit (stops render threads) before quit
+            self.pop()
         pygame.quit()	
