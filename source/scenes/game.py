@@ -30,7 +30,7 @@ class GameScene(Scene):
             except StopIteration as done:
                 world = done.value
 
-        self.terrain = world["terrain"]
+        self.terrain = world.get("terrain")     # unused by the static renderer
         self.renderer = world["renderer"]
         self.cam_x, self.cam_y = world["cam"]   # world-space top-left at zoom 1
         self.zoom = 1.0
