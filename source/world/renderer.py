@@ -1,21 +1,43 @@
-"""Screen-space streaming terrain renderer over a drifting cloud background.
+"""World-space point-store terrain renderer over a drifting cloud background.
 
-Model: a drifting billow cloud fills the background; terrain streams in ON TOP,
-fading in (alpha) to cover the cloud where it spawns. Unexplored area shows the
-moving clouds; as terrain points accumulate they fade from cloud to solid ground.
+Model (replaces the old screen-anchored scrolling buffer entirely):
 
-A full-speed worker thread drains the exposed area (no per-frame budget): it
-scatters random points, samples each (numpy -> GIL released, so genuinely
-parallel) and splats a soft, semi-transparent kernel into an alpha buffer.
-Selection is biased AWAY from the nearest screen edge, so the fill creeps inward
-off the frame (soft trailing edge) rather than repopulating evenly. Main draws
-the cloud background, then blits the alpha buffer over it.
+  * Terrain is a flat store of world-space points (x, y, z, colour). World space
+    is in pixel units; a point's cell coords are world/tile (what the sampler
+    wants). The store knows nothing about the screen window.
+  * The screen is a movable, zoomable VIEW: a world-space center + a zoom factor.
+    Pan moves the center; zoom is a draw-time scale only (world->screen happens at
+    blit time, never a resplat/regen). Soft/blurry when zoomed in is intended.
 
-Object protocol: covers_screen: bool; sample_points(X, Y) -> (height, colour).
+Generation (worker thread, unthrottled — never on the main thread, never
+budget-limited):
 
-Threading: the worker owns/mutates the buffer (scroll/blank/splat); main only
-reads it. A lock guards a worker SCROLL against a main read; splats run lock-free
-(a pixel caught mid-write is at worst one frame stale).
+  * An elastic kernel center springs toward the view center each tick by a
+    fraction of the gap (near -> slow, far -> fast); `spring` is the stiffness.
+  * Each tick scatters `gen_rate` points with gaussian spread `gen_sigma` around
+    the kernel center, samples each through the object sampler for z/colour, and
+    appends them.
+  * Fixed point `cap`. At cap, each new point evicts the farthest-from-view-center
+    existing point (world-space distance). Eviction is the density control: the
+    store settles to the `cap` points closest to where you're looking.
+
+Concurrency — a triple buffer with reference-rotation handoff (no full copy on
+the hot path):
+
+  * Three point buffers: write / interstitial / read. The producer owns `write`,
+    promotes write<->interstitial under a short lock, and the reader grabs the
+    interstitial into `read` under the same lock (read<->interstitial). A buffer's
+    life is write -> interstitial -> read -> interstitial -> recycled to write.
+  * The buffer recycled back to the producer is STALE. The producer reconciles it
+    up to current truth by replaying its own append/evict delta (the slots it
+    changed, tagged by a generation counter) — O(changes), not O(cap) — falling
+    back to a single bulk copy only if the backlog ever exceeds the cap.
+  * The reader's acquire is an O(1) reference grab; the producer never stalls on
+    the reader, and the reader never stalls beyond the swap's tiny critical
+    section (it iterates its buffer entirely outside the lock).
+
+Object protocol (unchanged): covers_screen: bool; sample_points(X, Y) ->
+(height, colour). The sampler and the cloud background are deliberately untouched.
 """
 import threading
 import time
@@ -23,12 +45,9 @@ import time
 import numpy as np
 import pygame
 
-BATCH = 400
-
 
 def _make_kernel(radius, peak):
-    # soft, semi-transparent disc; accumulating these alpha-composites terrain
-    # up from transparent (cloud showing) to opaque -> points fade in.
+    # soft, semi-transparent disc; tinted per point colour at draw time.
     d = radius * 2 + 1
     yy, xx = np.mgrid[0:d, 0:d]
     dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2) / max(1, radius)
@@ -56,36 +75,68 @@ def _make_cloud_tex(size, seed):
     return tex.astype(np.float32)
 
 
+class _Buf:
+    """One point buffer: parallel slot arrays + the generation it last reflects.
+
+    Slots are stable indices in [0, cap); `valid` marks which hold a live point.
+    `synced_gen` is the producer generation this buffer's contents represent, used
+    to decide how far it must be replayed when it cycles back to the producer.
+    """
+    __slots__ = ("pos", "z", "col", "valid", "synced_gen")
+
+    def __init__(self, cap):
+        self.pos = np.zeros((cap, 2), np.float64)
+        self.z = np.zeros(cap, np.float64)
+        self.col = np.zeros((cap, 3), np.uint8)
+        self.valid = np.zeros(cap, bool)
+        self.synced_gen = 0
+
+
 class Renderer:
     def __init__(self, screen_w, screen_h, *, tile=16, objects=(),
-                 density=0.03, oversize=3, bg=(15, 17, 21),
-                 cloud=True, cloud_scale=0.55, cloud_drift=(0.35, 0.14),
-                 cloud_seed=0, cloud_depth=85, fill_bias=3, fade=200, cell=32):
+                 cap=None, coverage=2.5, spring=0.08, gen_sigma=None, gen_rate=400,
+                 bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
+                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85, fade=200):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.objects = list(objects)
-        self.density = density
-        self.fill_bias = fill_bias
-        self.cell = cell
+        # the one object that actually feeds points (covers_screen) is the sampler
+        self._sampler = next((o for o in self.objects
+                              if getattr(o, "covers_screen", False)), None)
         self.bg = bg
-        self.radius = max(1, int(tile * 0.95))
-        self.kernel = _make_kernel(self.radius, fade)
-        self._kc = {}
-        self.M = oversize * tile
-        self.bw = self.w + 2 * self.M
-        self.bh = self.h + 2 * self.M
-        self.buffer = pygame.Surface((self.bw, self.bh), pygame.SRCALPHA)
-        self.buffer.fill((0, 0, 0, 0))                 # transparent -> cloud shows through
-        self.buf_ox = 0
-        self.buf_oy = 0
+
+        self.cap = int(cap) if cap else int(coverage * (self.w / tile) * (self.h / tile))
+        self.spring = spring
+        self.gen_sigma = gen_sigma if gen_sigma is not None else 0.5 * max(self.w, self.h)
+        self.gen_rate = gen_rate
+
+        # --- view (main thread writes, worker reads) ---
+        self.cam_x = 0.0          # world-space top-left of the view at zoom 1
+        self.cam_y = 0.0
+        self.zoom = 1.0           # draw-time scale only; set by the scene
+        # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0   # clamp — needed eventually (see draw/scene)
+
+        # --- point store: triple buffer (producer owns _W) ---
+        self._W = _Buf(self.cap)        # write  (producer truth)
+        self._I = _Buf(self.cap)        # interstitial (handoff slot)
+        self._R = _Buf(self.cap)        # read   (reader-owned)
+        self._count = 0                 # live points in truth
+        self._gen = 0                   # producer generation counter
+        self._log = []                  # [(gen, slots, pos, z, col, valid)] deltas
+        self._dirty = []                # slot-index arrays touched this interval
+        self._kc = None                 # elastic kernel center (world space)
         self._rng = np.random.default_rng()
-        self.cam_x = 0
-        self.cam_y = 0
-        self._init = False
-        self._prefetch = max(self.radius + tile, self.M - self.radius)
-        self.dirty = []
-        self._lock = threading.Lock()
-        self._edge_norm = 0.5 * min(self.w, self.h)
+        self._lock = threading.Lock()   # guards ONLY the buffer ref rotation
+
+        # --- draw kernels (main thread only) ---
+        self.radius = max(1, int(tile * 0.95))
+        self._base_kernel = _make_kernel(self.radius, fade)
+        self._zoom_bucket = None        # last zoom the scaled base was built for
+        self._scaled_base = self._base_kernel
+        self._scaled_r = self.radius
+        self._tint = {}                 # colour-bucket -> tinted scaled kernel
+
+        # --- cloud background (untouched) ---
         self.cloud = cloud
         if cloud:
             self.cloud_tex = _make_cloud_tex(512, cloud_seed)
@@ -94,171 +145,158 @@ class Renderer:
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
             self._cloud_surf = pygame.Surface((self.w, self.h))
+
         self._running = True
-        self._worker = threading.Thread(target=self._work, name="splat", daemon=True)
+        self._worker = threading.Thread(target=self._work, name="gen", daemon=True)
         self._worker.start()
 
+    # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
-        self.cam_x, self.cam_y = int(x), int(y)
+        self.cam_x, self.cam_y = float(x), float(y)
+
+    def set_zoom(self, z):
+        self.zoom = float(z)
+
+    def _view_center(self):
+        return self.cam_x + self.w * 0.5, self.cam_y + self.h * 0.5
 
     def pending_points(self):
-        with self._lock:
-            return sum(d[4] for d in self.dirty)
+        # loading progress: how many points until the store first fills to cap.
+        return max(0, self.cap - self._count)
 
-    # --- worker side ------------------------------------------------------
-    def _splat(self, px, py, colour):
-        r = self.radius
-        for i in range(px.shape[0]):
-            c = colour[i]
-            key = (int(c[0]) & ~7, int(c[1]) & ~7, int(c[2]) & ~7)
-            k = self._kc.get(key)
-            if k is None:
-                k = self.kernel.copy()
-                k.fill((*key, 255), special_flags=pygame.BLEND_RGBA_MULT)
-                self._kc[key] = k
-            self.buffer.blit(k, (px[i] - r, py[i] - r))
-
-    def _stream(self, budget):
-        if not self.dirty:
-            return
-        rb = np.array([(x, y, w, h) for x, y, w, h, _, _ in self.dirty], dtype=float)
-        rem_arr = np.array([d[4] for d in self.dirty], dtype=float)
-        init_arr = np.array([max(1.0, d[5]) for d in self.dirty], dtype=float)
-        areas = rb[:, 2] * rb[:, 3]
-        total = areas.sum()
-        remaining = rem_arr.sum()
-        budget = min(int(budget), int(remaining))
-        if total <= 0 or budget <= 0:
-            if remaining <= 0:
-                self.dirty = []
-            return
-        # oversample, then keep `budget` biased AWAY from the nearest screen edge
-        # (fills in even rings -> soft trailing edge, no corner lag); Gumbel-top-k.
-        n = budget * 4
-        rem_arr = np.array([d[4] for d in self.dirty], dtype=float)
-        frac = np.clip(rem_arr / np.maximum(1.0, self.density * areas), 0.0, 1.0) ** 2
-        cidx = self._rng.choice(len(self.dirty), size=n, p=areas / total)
-        csel = rb[cidx]
-        cpx = csel[:, 0] + self._rng.random(n) * csel[:, 2]
-        cpy = csel[:, 1] + self._rng.random(n) * csel[:, 3]
-        sx = cpx - (self.cam_x - self.buf_ox)
-        sy = cpy - (self.cam_y - self.buf_oy)
-        edge = np.minimum(np.minimum(sx, self.w - sx),
-                          np.minimum(sy, self.h - sy)) / self._edge_norm
-        g = -np.log(-np.log(self._rng.random(n) + 1e-12) + 1e-12)
-        # bias fades as a region fills (frac -> 0) so the final points land
-        # uniformly and the edges catch up to full density -> clean settle.
-        pick = np.argpartition(g + edge * (self.fill_bias * frac[cidx]),
-                               n - budget)[n - budget:]
-        idx = cidx[pick]
-        px = cpx[pick]
-        py = cpy[pick]
-        X = (px + self.buf_ox) / self.tile
-        Y = (py + self.buf_oy) / self.tile
-        for obj in self.objects:
-            if getattr(obj, "covers_screen", False):
-                _, colour = obj.sample_points(X, Y)
-                self._splat(px, py, colour.astype(np.int64))
-                break
-        counts = np.bincount(idx, minlength=len(self.dirty))
-        self.dirty = [(x, y, w, h, rem - int(counts[i]), init)
-                      for i, (x, y, w, h, rem, init) in enumerate(self.dirty)
-                      if rem - int(counts[i]) > 0]
-
-    def _mark(self, rect):
-        x, y, w, h = rect
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.bw, x + w), min(self.bh, y + h)
-        if x1 <= x0 or y1 <= y0:
-            return
-        self.buffer.fill((0, 0, 0, 0), (x0, y0, x1 - x0, y1 - y0))   # back to cloud
-        m = self.radius
-        ex0, ey0 = max(0, x0 - m), max(0, y0 - m)
-        ex1, ey1 = min(self.bw, x1 + m), min(self.bh, y1 + m)
-        # subdivide into small cells so each fills to full density uniformly
-        # (no under-filled fringe); the bias then orders cells, not pixels.
-        c = self.cell
-        cy = ey0
-        while cy < ey1:
-            ch = min(c, ey1 - cy)
-            cx = ex0
-            while cx < ex1:
-                cw = min(c, ex1 - cx)
-                cnt = int(self.density * cw * ch)
-                if cnt > 0:
-                    self.dirty.append((cx, cy, cw, ch, cnt, cnt))
-                cx += c
-            cy += c
-
-    def _recenter(self):
-        wx, wy = self.cam_x - self.buf_ox, self.cam_y - self.buf_oy
-        p = self._prefetch
-        if not (wx < p or wy < p or wx > self.bw - self.w - p or wy > self.bh - self.h - p):
-            return
-        to_ox, to_oy = self.cam_x - self.M, self.cam_y - self.M
-        ddx, ddy = to_ox - self.buf_ox, to_oy - self.buf_oy
-        if abs(ddx) >= self.bw or abs(ddy) >= self.bh:
-            self.buf_ox, self.buf_oy = to_ox, to_oy
-            self.dirty = []
-            self._mark((0, 0, self.bw, self.bh))
-            return
-        self.buffer.scroll(-ddx, -ddy)
-        self.buf_ox, self.buf_oy = to_ox, to_oy
-        shifted = []
-        for bx, by, bw, bh, rem, init in self.dirty:
-            nx, ny = bx - ddx, by - ddy
-            cx0, cy0 = max(0, nx), max(0, ny)
-            cx1, cy1 = min(self.bw, nx + bw), min(self.bh, ny + bh)
-            if cx1 > cx0 and cy1 > cy0:
-                frac = ((cx1 - cx0) * (cy1 - cy0)) / (bw * bh)
-                shifted.append((cx0, cy0, cx1 - cx0, cy1 - cy0,
-                                int(rem * frac), max(1, int(init * frac))))
-        self.dirty = shifted
-        # Expose the newly-revealed L-shape WITHOUT overlapping the two strips:
-        # a shared corner marked twice gets double the point budget and fills at
-        # 2x density, racing ahead of its neighbours (the completed-box trail).
-        if ddx > 0:
-            vx0, vx1 = self.bw - ddx, self.bw
-        elif ddx < 0:
-            vx0, vx1 = 0, -ddx
+    # --- worker side: generate into truth (self._W), no lock --------------
+    def _gen_step(self):
+        cx, cy = self._view_center()
+        if self._kc is None:
+            self._kc = np.array([cx, cy], dtype=float)
         else:
-            vx0 = vx1 = 0
-        if vx1 > vx0:
-            self._mark((vx0, 0, vx1 - vx0, self.bh))         # vertical strip, full height
-        if ddy > 0:
-            hy0, hy1 = self.bh - ddy, self.bh
-        elif ddy < 0:
-            hy0, hy1 = 0, -ddy
+            # elastic spring: move a fraction of the gap (far -> fast, near -> slow)
+            self._kc[0] += (cx - self._kc[0]) * self.spring
+            self._kc[1] += (cy - self._kc[1]) * self.spring
+        if self._sampler is None:
+            return 0
+        m = self.gen_rate
+        gx = self._kc[0] + self._rng.standard_normal(m) * self.gen_sigma
+        gy = self._kc[1] + self._rng.standard_normal(m) * self.gen_sigma
+        _, colour = self._sampler.sample_points(gx / self.tile, gy / self.tile)
+        z = np.zeros(m)            # height kept in the model; not used by draw yet
+        return self._place(gx, gy, z, colour.astype(np.uint8), cx, cy)
+
+    def _place(self, gx, gy, z, col, cx, cy):
+        """Append points, evicting the farthest-from-center when at cap. Records
+        every touched slot into self._dirty. Returns the number of changes."""
+        W, cap = self._W, self.cap
+        changed = 0
+
+        free = cap - self._count
+        if free > 0:
+            k = int(min(free, gx.size))
+            idx = np.arange(self._count, self._count + k)
+            W.pos[idx, 0] = gx[:k]; W.pos[idx, 1] = gy[:k]
+            W.z[idx] = z[:k]; W.col[idx] = col[:k]; W.valid[idx] = True
+            self._count += k
+            self._dirty.append(idx)
+            changed += k
+            gx, gy, z, col = gx[k:], gy[k:], z[k:], col[k:]
+
+        m = int(gx.size)
+        if m > 0 and self._count >= cap:
+            if m > cap:                          # never generate more than the cap
+                gx, gy, z, col, m = gx[:cap], gy[:cap], z[:cap], col[:cap], cap
+            ex = W.pos[:, 0] - cx; ey = W.pos[:, 1] - cy
+            dex = ex * ex + ey * ey
+            # the m farthest-from-center slots are evicted; the m new points take
+            # their place. Keeping the new and dropping the farthest is what holds
+            # the store at a stable gaussian blob (extent ~ gen_sigma) instead of
+            # collapsing it toward the center over time.
+            far = np.argpartition(dex, cap - m)[cap - m:].astype(np.intp)
+            W.pos[far, 0] = gx; W.pos[far, 1] = gy
+            W.z[far] = z; W.col[far] = col       # valid already True at these slots
+            self._dirty.append(far)
+            changed += m
+        return changed
+
+    def _promote(self):
+        """Close this interval's delta, rotate write<->interstitial under the
+        lock, then reconcile the recycled (stale) buffer back up to truth."""
+        if self._dirty:
+            slots = np.unique(np.concatenate(self._dirty))
+            self._dirty = []
         else:
-            hy0 = hy1 = 0
-        if hy1 > hy0:
-            hx0, hx1 = 0, self.bw                            # horizontal strip,
-            if ddx > 0:
-                hx1 = self.bw - ddx                          # minus the vertical strip's
-            elif ddx < 0:
-                hx0 = -ddx                                   # column (corner already done)
-            if hx1 > hx0:
-                self._mark((hx0, hy0, hx1 - hx0, hy1 - hy0))
+            slots = np.empty(0, np.intp)
+
+        W = self._W
+        self._gen += 1
+        W.synced_gen = self._gen
+        # snapshot the final value of every slot changed this interval
+        self._log.append((self._gen, slots, W.pos[slots].copy(), W.z[slots].copy(),
+                          W.col[slots].copy(), W.valid[slots].copy()))
+
+        with self._lock:                      # tiny critical section: refs only
+            self._W, self._I = self._I, self._W
+            new_w = self._W                   # stale, producer-exclusive now
+            truth = self._I                   # freshly promoted == current truth
+
+        self._reconcile(new_w, truth)
+        self._trim_log()
+
+    def _reconcile(self, buf, truth):
+        """Bring a stale buffer up to current truth by replaying the deltas it
+        missed (O(changes)); bulk-copy only if the backlog exceeds the cap."""
+        sg = buf.synced_gen
+        replay = [b for b in self._log if b[0] > sg]
+        total = sum(int(b[1].size) for b in replay)
+        if total == 0:
+            buf.synced_gen = self._gen
+            return
+        if total >= self.cap:
+            buf.pos[:] = truth.pos; buf.z[:] = truth.z
+            buf.col[:] = truth.col; buf.valid[:] = truth.valid
+        else:
+            for _, slots, pos, z, col, valid in replay:
+                buf.pos[slots] = pos; buf.z[slots] = z
+                buf.col[slots] = col; buf.valid[slots] = valid
+        buf.synced_gen = self._gen
+
+    def _trim_log(self):
+        lo = min(self._W.synced_gen, self._I.synced_gen, self._R.synced_gen)
+        i = 0
+        while i < len(self._log) and self._log[i][0] <= lo:
+            i += 1
+        if i:
+            del self._log[:i]
 
     def _work(self):
         while self._running:
-            with self._lock:
-                if not self._init:
-                    self.buf_ox = self.cam_x - self.M
-                    self.buf_oy = self.cam_y - self.M
-                    self.dirty = []
-                    self._mark((0, 0, self.bw, self.bh))
-                    self._init = True
-                else:
-                    self._recenter()
-            if self.dirty:
-                self._stream(BATCH)
-            else:
-                time.sleep(0.005)
+            changed = self._gen_step()
+            self._promote()
+            if not changed:
+                time.sleep(0.004)        # idle only when fully settled
 
-    # --- main side --------------------------------------------------------
+    # --- main side: draw --------------------------------------------------
     def render(self):
-        pass                                  # all generation is on the worker
+        pass                             # all generation is on the worker
+
+    def _ensure_kernels(self, zoom):
+        zb = round(zoom, 2)
+        if zb == self._zoom_bucket:
+            return
+        self._zoom_bucket = zb
+        r = max(1, int(round(self.radius * zoom)))
+        d = r * 2 + 1
+        self._scaled_r = r
+        self._scaled_base = (self._base_kernel if r == self.radius
+                             else pygame.transform.smoothscale(self._base_kernel, (d, d)))
+        self._tint = {}                  # colours must be re-tinted at the new size
+
+    def _kernel_for(self, c):
+        key = (int(c[0]) & ~7, int(c[1]) & ~7, int(c[2]) & ~7)
+        k = self._tint.get(key)
+        if k is None:
+            k = self._scaled_base.copy()
+            k.fill((*key, 255), special_flags=pygame.BLEND_RGBA_MULT)
+            self._tint[key] = k
+        return k
 
     def _cloud_background(self, target):
         size = self.cloud_tex.shape[0]
@@ -283,13 +321,28 @@ class Renderer:
             self._cloud_background(target)
         else:
             target.fill(self.bg)
-        with self._lock:
-            wx, wy = self.cam_x - self.buf_ox, self.cam_y - self.buf_oy
-            sx0, sy0 = max(0, wx), max(0, wy)
-            sx1, sy1 = min(self.bw, wx + self.w), min(self.bh, wy + self.h)
-            if sx1 > sx0 and sy1 > sy0:
-                target.blit(self.buffer, (sx0 - wx, sy0 - wy),
-                            area=pygame.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0))
+
+        with self._lock:                          # O(1) acquire: grab latest ready
+            self._R, self._I = self._I, self._R
+            rb = self._R                          # reader-owned until next acquire
+
+        valid = rb.valid
+        if valid.any():
+            zoom = self.zoom
+            # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0; zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
+            self._ensure_kernels(zoom)
+            r = self._scaled_r
+            cx, cy = self._view_center()
+            pos = rb.pos[valid]; col = rb.col[valid]
+            # world -> screen: translate by view center, scale by zoom, re-center
+            sx = self.w * 0.5 + (pos[:, 0] - cx) * zoom
+            sy = self.h * 0.5 + (pos[:, 1] - cy) * zoom
+            on = (sx > -r) & (sx < self.w + r) & (sy > -r) & (sy < self.h + r)
+            sx = sx[on] - r; sy = sy[on] - r; col = col[on]
+            seq = [(self._kernel_for(col[i]), (sx[i], sy[i])) for i in range(sx.size)]
+            if seq:
+                target.blits(seq, doreturn=False)
+
         if self.cloud:
             self.cloud_t += 1.0
 

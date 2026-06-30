@@ -1,6 +1,7 @@
-"""In-game scene: a camera over the screen-space renderer. Drag to pan; the
-renderer scrolls its oversized buffer and refills exposed strips. Generation
-lives in build_world; this scene receives a prebuilt world or runs it inline.
+"""In-game scene: a movable, zoomable view over the world-space point renderer.
+Drag to pan (in world units, so it tracks the cursor at any zoom); wheel to zoom
+(draw-time scale only — the renderer never regenerates on zoom). Generation lives
+in build_world; this scene receives a prebuilt world or runs it inline.
 """
 from source import config
 from source.scenes.base import Scene
@@ -26,7 +27,8 @@ class GameScene(Scene):
 
         self.terrain = world["terrain"]
         self.renderer = world["renderer"]
-        self.cam_x, self.cam_y = world["cam"]
+        self.cam_x, self.cam_y = world["cam"]   # world-space top-left at zoom 1
+        self.zoom = 1.0
         self._drag = None
 
         cx, w, h = config.SCREEN_W // 2, 240, 56
@@ -59,11 +61,15 @@ class GameScene(Scene):
         elif event.type == pygame.MOUSEMOTION and self._drag is not None:
             dx = event.pos[0] - self._drag[0]
             dy = event.pos[1] - self._drag[1]
-            self.cam_x -= dx                  # grab-and-drag the map
-            self.cam_y -= dy
+            self.cam_x -= dx / self.zoom       # grab-and-drag in world units
+            self.cam_y -= dy / self.zoom
             self._drag = event.pos
         elif event.type == pygame.MOUSEBUTTONUP:
             self._drag = None
+        elif event.type == pygame.MOUSEWHEEL:
+            self.zoom *= 1.1 ** event.y        # wheel up zooms in; unclamped
+            # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0   # clamp — needed eventually
+            # self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom))
 
     def update(self, dt):
         self.state.tick += 1
@@ -72,7 +78,8 @@ class GameScene(Scene):
 
     def draw(self, surface):
         self.renderer.set_camera(self.cam_x, self.cam_y)
-        self.renderer.render()                # cheap: nothing within slack, else a strip
+        self.renderer.set_zoom(self.zoom)
+        self.renderer.render()                # no-op: all generation is on the worker
         self.renderer.draw(surface)
         label = self.app.font_small.render(f"seed {self.state.seed}", True, config.TEXT)
         surface.blit(label, (12, 12))
