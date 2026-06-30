@@ -110,7 +110,7 @@ class Renderer:
         self._prev_zoom = 1.0
         self._prev_now = time.monotonic()
 
-        # --- cloud background (untouched) ---
+        # --- cloud background ---
         self.cloud = cloud
         if cloud:
             self.cloud_tex = _make_cloud_tex(512, cloud_seed)
@@ -118,7 +118,10 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
-            self._cloud_surf = pygame.Surface((self.w, self.h))
+            # shade + upscale the periodic texture to screen scale ONCE; the
+            # per-frame cloud is then just a tiled scroll-blit (the texture only
+            # ever scrolls — parallax from the camera, drift over time).
+            self._cloud_big, self._cloud_B = self._build_cloud_big()
 
     # --- view API ---------------------------------------------------------
     def set_camera(self, x, y):
@@ -300,23 +303,45 @@ class Renderer:
         scaled.set_colorkey(_CKEY)
         target.blit(scaled, (int(ox - sw * 0.5), int(oy - sh * 0.5)))
 
-    def _cloud_background(self, target, cam_x, cam_y):
-        size = self.cloud_tex.shape[0]
-        dx, dy = self.cloud_drift
-        s = self.cloud_scale
-        xs = (((np.arange(self.w) + cam_x) * s + self.cloud_t * dx).astype(np.int64)) % size
-        ys = (((np.arange(self.h) + cam_y) * s + self.cloud_t * dy).astype(np.int64)) % size
-        noise = self.cloud_tex[np.ix_(ys, xs)]
-        billow = np.abs(noise * 2.0 - 1.0)            # abs of signed noise -> bulbous
+    def _build_cloud_big(self):
+        """Shade the whole periodic texture (the billow + depth colouring), then
+        upscale by 1/scale to screen sampling. The result tiles seamlessly (the
+        source is periodic), so per frame the cloud is a scroll-blit, not numpy."""
+        billow = np.abs(self.cloud_tex * 2.0 - 1.0)   # abs of signed noise -> bulbous
         d = self.cloud_depth
         shade = (255 - (1.0 - billow) * d).astype(np.uint8)
         blue = (255 - (1.0 - billow) * (d * 0.7)).astype(np.uint8)
-        rgb = pygame.surfarray.pixels3d(self._cloud_surf)
+        size = self.cloud_tex.shape[0]
+        surf = pygame.Surface((size, size))
+        rgb = pygame.surfarray.pixels3d(surf)
         rgb[:, :, 0] = shade.T
         rgb[:, :, 1] = shade.T
         rgb[:, :, 2] = blue.T
         del rgb
-        target.blit(self._cloud_surf, (0, 0))
+        B = int(round(size / self.cloud_scale))       # period in screen px
+        big = pygame.transform.scale(surf, (B, B))
+        try:
+            big = big.convert()
+        except pygame.error:
+            pass
+        return big, B
+
+    def _cloud_background(self, target, cam_x, cam_y):
+        B = self._cloud_B
+        s = self.cloud_scale
+        dx, dy = self.cloud_drift
+        # screen pixel i shows big-pixel (i + cam + t*drift/s); blit so big-pixel
+        # (ox, oy) lands at the top-left, tiled to cover the screen.
+        ox = int(round(cam_x + self.cloud_t * dx / s)) % B
+        oy = int(round(cam_y + self.cloud_t * dy / s)) % B
+        big = self._cloud_big
+        y = -oy
+        while y < self.h:
+            x = -ox
+            while x < self.w:
+                target.blit(big, (x, y))              # clipped to the screen
+                x += B
+            y += B
 
     def draw(self, target):
         cam = self._cam
