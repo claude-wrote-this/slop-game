@@ -23,9 +23,12 @@ import numpy as np
 import pygame
 
 
+_CKEY = (255, 0, 255)   # colorkey for opaque kernels; never in the green palette
+
+
 def _make_kernel(radius):
-    # solid filled circle: full alpha inside, ~1px antialiased edge (not a blur).
-    # tinted per point colour at draw time.
+    # SRCALPHA solid circle, ~1px antialiased edge. Used for FADING points, which
+    # need real per-pixel alpha; settled points use the faster opaque colorkey one.
     d = radius * 2 + 1
     yy, xx = np.mgrid[0:d, 0:d]
     dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2)
@@ -97,12 +100,10 @@ class Renderer:
         self._thread.start()
 
         # --- draw kernels (main thread only) ---
-        self._base_kernel = _make_kernel(self.radius)
         self._zoom_bucket = None
-        self._scaled_base = self._base_kernel
         self._scaled_r = self.radius
-        self._tint = {}                 # colour key -> tinted scaled kernel (settled)
-        self._fade = {}                 # (colour key, progress level) -> faded kernel
+        self._solid = {}                # colour key -> opaque colorkey circle (settled)
+        self._fade = {}                 # (colour key, progress level) -> SRCALPHA kernel
         self._FADE_LEVELS = 6           # quantise fade progress so kernels cache
 
         # --- cloud background (untouched) ---
@@ -160,13 +161,9 @@ class Renderer:
         if zb == self._zoom_bucket:
             return
         self._zoom_bucket = zb
-        r = max(1, int(round(self.radius * zoom)))
-        self._scaled_r = r
-        # regenerate the circle crisply at the new radius (don't smooth-scale a
-        # small one up — that's what reads as blur when zoomed in)
-        self._scaled_base = self._base_kernel if r == self.radius else _make_kernel(r)
-        self._tint = {}                   # colours must be re-tinted at the new size
-        self._fade = {}                   # ...and the faded kernels rebuilt
+        self._scaled_r = max(1, int(round(self.radius * zoom)))
+        self._solid = {}                  # rebuilt crisply at the new radius
+        self._fade = {}
 
     def _cloud_background(self, target, cam_x, cam_y):
         size = self.cloud_tex.shape[0]
@@ -194,24 +191,31 @@ class Renderer:
                 | cb[:, 2].astype(np.uint32))
 
     def _blit_settled(self, target, sx, sy, keys, r):
-        """Full size, full opacity, batched. The hot path — most points, every
-        frame — so it stays a single blits() with cached tinted kernels."""
+        """Full size, full opacity, batched. Opaque colorkey circles (RLE) — a
+        plain copy with no per-pixel alpha blend (~6x faster than SRCALPHA), which
+        is the right call for the hot path: most points, every frame."""
+        cache = self._solid
+        for k in np.unique(keys).tolist():        # only ~one per terrain colour
+            if k not in cache:
+                cache[k] = self._make_solid_kernel(r, k)
         xs = (sx - r).astype(np.int32).tolist()
         ys = (sy - r).astype(np.int32).tolist()
-        keys = keys.tolist()
-        base, cache = self._scaled_base, self._tint
-        seq = []
-        for i in range(len(xs)):
-            k = keys[i]
-            ker = cache.get(k)
-            if ker is None:
-                ker = base.copy()
-                ker.fill((k >> 16, (k >> 8) & 0xFF, k & 0xFF, 255),
-                         special_flags=pygame.BLEND_RGBA_MULT)
-                cache[k] = ker
-            seq.append((ker, (xs[i], ys[i])))
+        kers = [cache[k] for k in keys.tolist()]  # comprehension + zip beats append
+        seq = list(zip(kers, zip(xs, ys)))
         if seq:
             target.blits(seq, doreturn=False)
+
+    def _make_solid_kernel(self, r, ck):
+        d = r * 2 + 1
+        s = pygame.Surface((d, d))
+        s.fill(_CKEY)
+        pygame.draw.circle(s, (ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF), (r, r), r)
+        try:
+            s = s.convert()               # match the display format for a fast blit
+        except pygame.error:
+            pass                          # no display yet (headless tests)
+        s.set_colorkey(_CKEY, pygame.RLEACCEL)
+        return s
 
     def _blit_fading(self, target, sx, sy, keys, comp, now):
         """The fading minority: grow 0->full and fade transparent->opaque with
