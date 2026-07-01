@@ -138,7 +138,6 @@ class Renderer:
 
         # --- draw kernels (main thread only) ---
         self.radius = max(1, int(tile * 0.95))
-        self._zoom_bucket = None
         self._scaled_r = self.radius
         self._solid = {}
         self._fade = {}
@@ -148,7 +147,6 @@ class Renderer:
         self._layer = None
         self._layer_cam = (0.0, 0.0)
         self._layer_zoom = 1.0
-        self._prev_zoom = 1.0
         self._prev_now = time.monotonic()
         self._P, self._K, self._C, self._D, self._G = self._snap
 
@@ -431,22 +429,24 @@ class Renderer:
 
     # --- draw kernels -----------------------------------------------------
     def _ensure_kernels(self, zoom):
-        zb = round(zoom, 2)
-        if zb == self._zoom_bucket:
-            return
-        self._zoom_bucket = zb
+        # Scaled point radius follows zoom. Kernels are cached per radius (part of
+        # the cache key) so a live zoom reuses them instead of rebuilding every
+        # frame — that rebuild was what made continuous zoom stutter. Cap the caches
+        # so sweeping a wide zoom range can't grow them without bound.
         self._scaled_r = max(1, int(round(self.radius * zoom)))
-        self._solid = {}
-        self._fade = {}
+        if len(self._solid) > 2000:
+            self._solid = {}
+        if len(self._fade) > 4000:
+            self._fade = {}
 
     def _blit_settled(self, target, sx, sy, keys, r):
         cache = self._solid
         for k in np.unique(keys).tolist():
-            if k not in cache:
-                cache[k] = self._make_solid_kernel(r, k)
+            if (k, r) not in cache:
+                cache[(k, r)] = self._make_solid_kernel(r, k)
         xs = (sx - r).astype(np.int32).tolist()
         ys = (sy - r).astype(np.int32).tolist()
-        kers = [cache[k] for k in keys.tolist()]
+        kers = [cache[(k, r)] for k in keys.tolist()]
         seq = list(zip(kers, zip(xs, ys)))
         if seq:
             target.blits(seq, doreturn=False)
@@ -478,16 +478,16 @@ class Renderer:
         order = np.argsort(lv)[::-1]
         xs = sx[order].tolist(); ys = sy[order].tolist()
         keys = keys[order].tolist(); lv = lv[order].tolist()
-        cache = self._fade
+        cache = self._fade; sr = self._scaled_r
         for i in range(len(xs)):
             p = lv[i]
             if p <= 0:
                 continue
             ck = keys[i]
-            ent = cache.get((ck, p))
+            ent = cache.get((ck, p, sr))
             if ent is None:
                 ent = self._make_fade_kernel(ck, p)
-                cache[(ck, p)] = ent
+                cache[(ck, p, sr)] = ent
             ker, kr = ent
             target.blit(ker, (int(xs[i]) - kr, int(ys[i]) - kr))
 
@@ -571,18 +571,6 @@ class Renderer:
         just = (comp > self._prev_now) & (comp <= now)
         if just.any():
             self._blit_settled(self._layer, sx[just], sy[just], keys[just], self._scaled_r)
-
-    def _reproject(self, target, cam, zoom):
-        L = self._layer
-        scale = zoom / self._layer_zoom
-        lcx, lcy = self._layer_cam
-        ox = self.w * 0.5 + (lcx - cam[0]) * zoom
-        oy = self.h * 0.5 + (lcy - cam[1]) * zoom
-        sw = max(1, int(round(self.w * scale)))
-        sh = max(1, int(round(self.h * scale)))
-        scaled = pygame.transform.scale(L, (sw, sh))
-        scaled.set_colorkey(_CKEY)
-        target.blit(scaled, (int(ox - sw * 0.5), int(oy - sh * 0.5)))
 
     # --- cloud ------------------------------------------------------------
     def _build_cloud_big(self):
@@ -788,16 +776,16 @@ class Renderer:
         if self._layer is None:
             self._layer = self._new_layer()
             self._rebuild_layer(now, cam, zoom)
-            target.blit(self._layer, (0, 0))
         elif zoom == self._layer_zoom:
-            self._scroll_layer(now, cam, zoom)
+            self._scroll_layer(now, cam, zoom)      # pan: scroll + fill exposed strips
             self._commit_settles(now, cam, zoom)
-            target.blit(self._layer, (0, 0))
-        elif zoom == self._prev_zoom:
-            self._rebuild_layer(now, cam, zoom)
-            target.blit(self._layer, (0, 0))
         else:
-            self._reproject(target, cam, zoom)
+            # Zoom changed: rebuild the layer crisp at the new zoom every frame so it
+            # fills the screen at the correct scale, instead of bitmap-scaling the old
+            # layer (which shrank it into the middle and popped in on release). A full
+            # rebuild costs about the same as that scale, so this is ~free.
+            self._rebuild_layer(now, cam, zoom)
+        target.blit(self._layer, (0, 0))
 
         if now < self._max_comp:          # any point still mid-fade?
             sx, sy, keys, comp, dur, grow = self._cull(cam, zoom, 0, 0, self.w, self.h)
@@ -809,7 +797,6 @@ class Renderer:
         if self.cloud_front:              # cloud front veils the resolving edge
             self._cloud_front_pass(target, cam, zoom, now)
 
-        self._prev_zoom = zoom
         self._prev_now = now
         if self.cloud:
             self.cloud_t += 1.0
