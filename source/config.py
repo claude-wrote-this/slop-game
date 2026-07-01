@@ -30,7 +30,7 @@ MUTED  = (140, 146, 156)
 
 # --- terrain ---
 TERRAIN_TILE = 16        # px per cell
-TERRAIN_LAYERS = 6       # height quantisation steps
+TERRAIN_LAYERS = 100     # vertical occupancy layers (~a person is a few layers)
 TERRAIN_SCALE = 0.06     # noise frequency (smaller = larger landforms)
 TERRAIN_OCTAVES = 4
 

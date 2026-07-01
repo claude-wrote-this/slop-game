@@ -9,23 +9,27 @@ This yields a full vertical occupancy column — a column can read solid/empty/s
 down its height, so overhangs and caves fall out naturally. The surface the
 renderer reads is the topmost solid layer per column.
 
+The whole (x, y, z) stack is evaluated at once — z is an added numpy axis, so all N
+layers are sampled in one vectorised pass with no Python z-loop, then reduced along
+z to the topmost solid layer. N is still the dominant cost (every layer is a full
+field evaluation over the point stack), so it is kept as the single knob and tuned
+from on-device measurement.
+
 t(z) rises with height from an always-solid floor: it climbs quickly through the
-low layers and levels off toward the ceiling, so ground is easy to hold low down
-and progressively harder up high. Most land sits low-to-mid and high ground is
-rare and sharp (a realistic hypsometric distribution) rather than the uniform
-slope a linear ramp gives. The `hypso` exponent is the single knob — higher makes
-the early rise steeper, widening the flat lowlands and making peaks rarer/sharper.
-(For this density a convex "slow at the bottom" rise pushes the surface up instead,
-so the curve is deliberately concave to get the stated bias.)
+low layers and eases toward the ceiling, so ground is easy to hold low down and
+progressively harder up high — most land sits low-to-mid, high ground rare and
+sharp (a realistic hypsometric distribution). The `hypso` exponent is the single
+knob: higher steepens the early rise, widening the flat lowlands and making peaks
+rarer/sharper. (A convex "slow at the bottom" rise does the opposite for this
+density, pushing the surface up, so the curve is deliberately concave.)
 
-The fractal structure is unchanged from the continuous model — domain-warped
-multi-octave fBm + ridged mountains — carried into the per-layer evaluation. The
-threshold curve controls how much land sits at each height; the fractal/ridge
-structure controls whether high ground forms coherent ranges vs scattered spikes.
-
-Everything is vectorised: the (x, y, z) stack is evaluated at once (z is an added
-axis), then reduced along z to the topmost solid layer before returning. Colour is
-a per-layer ramp for visibility (a deliberate placeholder). Pure function of world
+The fractal structure is the existing apparatus — domain-warped multi-octave fBm +
+ridged mountains — carried into the per-layer evaluation: z is a live coordinate
+(scaled by z_span) instead of a fixed decorrelation slice, and that vertical
+variation is what gives the sub-surface its overhangs and caves. The threshold
+curve controls how much land sits at each height; the fractal/ridge structure
+controls whether high ground forms coherent ranges vs scattered spikes. Colour is a
+per-layer ramp for visibility (a deliberate placeholder). Pure function of world
 (x, y, z), so any block sampled anywhere tiles seamlessly with its neighbours.
 """
 import numpy as np
@@ -43,11 +47,11 @@ _RAMP_ANCHORS = [(18, 46, 24), (40, 82, 42), (72, 120, 64),
 class TerrainHeight:
     covers_screen = True            # the renderer treats terrain as always on-screen
 
-    def __init__(self, seed, *, layers=6,
+    def __init__(self, seed, *, layers=100,
                  base_freq=0.011, mount_freq=0.03, detail_freq=0.11,
                  warp_freq=0.02, warp_amp=18.0,
                  octaves=5, mount_strength=1.15, detail_strength=0.05,
-                 hypso=1.6, z_span=3.5, solid_ceiling=0.55):
+                 hypso=1.6, z_span=2.5, solid_ceiling=0.85):
         self.noise = _Perlin3(seed)
         self.layers = layers
         self.base_freq = base_freq
@@ -104,10 +108,10 @@ class TerrainHeight:
     def _density(self, X, Y, Z):
         """Solidness in [0, 1] of the 3D field at world (X, Y) and noise-z Z.
         Broadcasts: with X, Y of shape (n, 1) and Z of shape (1, N) it returns the
-        full (n, N) occupancy stack in one shot. Z varies per layer, so the warp
-        and every field vary with height — that vertical variation is what gives
-        overhangs and caves. Same warp+fBm+ridged apparatus as the flat model, only
-        with a live z instead of a fixed decorrelation slice."""
+        full (n, N) occupancy stack in one shot — every layer at once, no z-loop. Z
+        varies per layer, so the warp and every field vary with height; that vertical
+        variation is what gives overhangs and caves. Same warp+fBm+ridged apparatus
+        as the flat model, only with a live z instead of a fixed slice."""
         wx = self._fbm(X, Y, Z + _Z_WARP_X, self.warp_freq, octaves=4)
         wy = self._fbm(X, Y, Z + _Z_WARP_Y, self.warp_freq, octaves=4)
         Xw = X + wx * self.warp_amp
@@ -125,13 +129,13 @@ class TerrainHeight:
     def sample_points(self, X, Y):
         """(height int, colour) at arbitrary world positions X, Y (cell units,
         fractional ok). Height is the topmost solid layer of each column's 3D
-        occupancy — the sub-surface is computed independently even though only the
-        top is returned. No grid — one value per point."""
+        occupancy — the whole stack is evaluated vectorised and only the top is
+        returned. No grid — one value per point."""
         X = np.asarray(X, float); Y = np.asarray(Y, float)
         shape = X.shape
         xf = X.reshape(-1)[:, None]                           # (n, 1)
         yf = Y.reshape(-1)[:, None]
-        d = self._density(xf, yf, self._znoise[None, :])      # (n, N)
+        d = self._density(xf, yf, self._znoise[None, :])      # (n, N) whole stack
         solid = d > self._thresh[None, :]                     # (n, N), layer 0 always
         # topmost solid layer per column: first solid scanning from the top down.
         top = (self.layers - 1) - np.argmax(solid[:, ::-1], axis=1)
