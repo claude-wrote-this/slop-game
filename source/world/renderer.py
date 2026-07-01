@@ -650,33 +650,23 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds are PINNED TO WORLD space: a texel sits at a fixed world (x, y)
-        # and is projected through the camera exactly like the terrain, so panning
-        # slides the clouds across the screen with the world (stationary relative to
-        # the world x/y grid, not to the screen). The world-locked tile origin a0
-        # (world 0,0 -> buffer) carries that pan; on top of it the radial breathing
-        # zoom expands about the kernel's projected screen position kpx. Anchor =
-        # kpx*(1-sc) + a0*sc is scale-about-pivot of the world-locked pattern: the
-        # fixed point of the per-frame scaling lands on kpx for every sc (radiates
-        # from the kernel), while a0 makes the whole thing track world coordinates.
+        # The clouds are centred on the resolved-terrain centre — the sampler kernel
+        # kc, projected to the buffer as (kpx, kpy) — and scroll radially outward from
+        # it. That projected centre is pinned as a tile lattice point, so it is the
+        # fixed point of the breathing zoom: as the tiles grow (sc 1->2) every texel
+        # flows outward from the kernel centre, and the crossfading second layer
+        # (half a phase ahead, each fading to zero at its own reset) hides the loop.
+        # The pattern rides with the kernel, so the outward flow always emanates from
+        # where the terrain is resolving. The tile wraps seamlessly, so as kc drifts
+        # the lattice slides under the centre without any visible seam.
         z = self.zoom
-        sx = z * bw / W                  # buffer px per world unit (x); sy for y
-        sy = z * bh / H
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
         kc = self._kc
         kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
-        kpx = bw * 0.5 + (kcx - vx) * sx           # kernel projected to the buffer
-        kpy = bh * 0.5 + (kcy - vy) * sy
+        kpx = bw * 0.5 + (kcx - vx) * z * bw / W    # kernel projected to the buffer
+        kpy = bh * 0.5 + (kcy - vy) * z * bh / H
         base = self._cloud_zt; B = self._cloud_zB
-        # World (0,0) projected to the buffer is millions of px off-screen when the
-        # camera has roamed far; the anchor multiplies it by the breathing scale sc,
-        # so left raw it sweeps hundreds of px per frame and the tiling just vibrates.
-        # Reducing it modulo one tile period B shifts the anchor by whole tiles (B*sc
-        # = T), which the mod-T tiling can't see — the pattern is identical but the
-        # numbers stay near the screen, so the breathing reads as a smooth flow again.
-        a0x = (bw * 0.5 - vx * sx) % B
-        a0y = (bh * 0.5 - vy * sy) % B
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
             phase = (t + k) % 1.0
@@ -689,10 +679,10 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            ax = kpx * (1.0 - sc) + a0x * sc   # scale about kpx; a0 tracks world x/y
-            ay = kpy * (1.0 - sc) + a0y * sc
-            sx0 = ax - T * math.ceil(ax / T)
-            sy0 = ay - T * math.ceil(ay / T)
+            # tile from the lattice point that keeps (kpx, kpy) fixed as T grows, so
+            # the pattern expands outward from the kernel centre.
+            sx0 = kpx - T * math.ceil(kpx / T)
+            sy0 = kpy - T * math.ceil(kpy / T)
             y = sy0
             while y < bh:
                 x = sx0
