@@ -650,22 +650,28 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds are centred on the resolved-terrain centre — the sampler kernel
-        # kc, projected to the buffer as (kpx, kpy) — and scroll radially outward from
-        # it. That projected centre is pinned as a tile lattice point, so it is the
-        # fixed point of the breathing zoom: as the tiles grow (sc 1->2) every texel
-        # flows outward from the kernel centre, and the crossfading second layer
-        # (half a phase ahead, each fading to zero at its own reset) hides the loop.
-        # The pattern rides with the kernel, so the outward flow always emanates from
-        # where the terrain is resolving. The tile wraps seamlessly, so as kc drifts
-        # the lattice slides under the centre without any visible seam.
+        # The clouds are centred on the resolved-terrain centre and scroll radially
+        # outward from it. That centre is the centroid of the resolved points, not the
+        # kernel: the kernel roams *around* the disc of points, so its position lags
+        # and orbits, whereas the mean of the points sits at the middle of the
+        # resolved region and barely moves as a few frontier points resolve or fade
+        # (an average over thousands is far steadier than a bbox/hull extent). It is
+        # projected to the buffer as (kpx, kpy) and pinned as a tile lattice point, so
+        # it is the fixed point of the breathing zoom: as the tiles grow (sc 1->2)
+        # every texel flows outward from the resolved centre, and the crossfading
+        # second layer (half a phase ahead, each fading to zero at its own reset)
+        # hides the loop. The tile wraps seamlessly, so as the centre drifts the
+        # lattice slides under it without any visible seam.
         z = self.zoom
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
-        kc = self._kc
-        kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
-        kpx = bw * 0.5 + (kcx - vx) * z * bw / W    # kernel projected to the buffer
-        kpy = bh * 0.5 + (kcy - vy) * z * bh / H
+        P = self._P
+        if P.shape[0]:
+            rcx, rcy = float(P[:, 0].mean()), float(P[:, 1].mean())   # resolved centre
+        else:
+            rcx, rcy = vx, vy
+        kpx = bw * 0.5 + (rcx - vx) * z * bw / W    # resolved centre projected to buffer
+        kpy = bh * 0.5 + (rcy - vy) * z * bh / H
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
