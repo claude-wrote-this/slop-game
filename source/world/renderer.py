@@ -668,9 +668,15 @@ class Renderer:
         kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
         kpx = bw * 0.5 + (kcx - vx) * sx           # kernel projected to the buffer
         kpy = bh * 0.5 + (kcy - vy) * sy
-        a0x = bw * 0.5 - vx * sx                   # world (0,0) projected to the buffer
-        a0y = bh * 0.5 - vy * sy
         base = self._cloud_zt; B = self._cloud_zB
+        # World (0,0) projected to the buffer is millions of px off-screen when the
+        # camera has roamed far; the anchor multiplies it by the breathing scale sc,
+        # so left raw it sweeps hundreds of px per frame and the tiling just vibrates.
+        # Reducing it modulo one tile period B shifts the anchor by whole tiles (B*sc
+        # = T), which the mod-T tiling can't see — the pattern is identical but the
+        # numbers stay near the screen, so the breathing reads as a smooth flow again.
+        a0x = (bw * 0.5 - vx * sx) % B
+        a0y = (bh * 0.5 - vy * sy) % B
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
             phase = (t + k) % 1.0
