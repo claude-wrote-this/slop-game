@@ -651,22 +651,18 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The zoom emanates from the kernel centre (where terrain generates), but the
-        # cloud field is world-attached: it pans *opposite* to the kernel's motion
-        # (parallax) rather than riding along with it, while keeping its outward
-        # drift. So: project kc to screen for the pivot, then translate the whole
-        # pattern by -cam*parallax. (Periodic tiling, so the pivot corner stays near
-        # the kernel and the translation just slides the pattern.)
-        kc = self._kc
-        z = self.zoom
-        if kc is not None:
-            kx = W * 0.5 + (kc[0] - (cam_x + W * 0.5)) * z
-            ky = H * 0.5 + (kc[1] - (cam_y + H * 0.5)) * z
-        else:
-            kx, ky = W * 0.5, H * 0.5
+        # Parallax driven by the kernel's own world position (self._kc), not the
+        # camera. The terrain scrolls opposite to the kernel's motion, so scrolling
+        # the cloud *with* kc (+kc*pf) sends it opposite to the terrain — a background
+        # that slides against the world instead of riding along with it. kc springs
+        # smoothly and is a plain world coordinate, so there's no camera/zoom coupling.
         pf = self._cloud_pf
-        pvx = (kx + cam_x * pf) * bw / W       # +cam: pan opposite to the content
-        pvy = (ky + cam_y * pf) * bh / H
+        kc = self._kc
+        if kc is not None:
+            pvx = bw * 0.5 + kc[0] * pf
+            pvy = bh * 0.5 + kc[1] * pf
+        else:
+            pvx, pvy = bw * 0.5, bh * 0.5
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
