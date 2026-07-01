@@ -35,9 +35,9 @@ from source.world.field import _Perlin3
 _Z_WARP_X, _Z_WARP_Y = 11.5, 23.5
 _Z_BASE, _Z_MOUNT, _Z_DETAIL = 0.5, 31.5, 47.5
 
-# per-layer colour ramp anchors (dark low ground -> pale high ground)
-_RAMP_ANCHORS = [(44, 54, 44), (74, 94, 60), (118, 132, 84),
-                 (150, 150, 108), (188, 182, 150), (222, 216, 196)]
+# per-layer colour ramp anchors: dark green low ground -> light green high ground
+_RAMP_ANCHORS = [(18, 46, 24), (40, 82, 42), (72, 120, 64),
+                 (112, 162, 92), (158, 202, 134), (208, 236, 188)]
 
 
 class TerrainHeight:
