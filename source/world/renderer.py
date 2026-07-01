@@ -189,7 +189,7 @@ class Renderer:
             self._front = []                 # (wx, wy, birth, life, r_px, cidx)
             self._front_cache = {}           # (r_px, alpha, cidx) -> soft disc surface
             self._front_alpha = 255          # grains reach full opacity mid-life
-            self._front_white = 240          # target white cover: white pts + puffs
+            self._front_white = 350          # target white cover: white pts + puffs
             self._front_white_rf = 0.5       # a point counts as white while rf > this
             self._front_fill = 260.0         # max puffs/sec ramp toward the target
             self._front_cap = 150
