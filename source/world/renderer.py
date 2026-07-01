@@ -650,21 +650,26 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds are LOCKED to the screen: they do not translate as you pan, so
-        # panning the view cancels out and the pattern stays put in screen space.
-        # Their only motion is the radial breathing zoom, which expands outward from
-        # the kernel's projected screen position kpx. Anchor = kpx*(1-sc) + centre*sc
-        # is scale-about-pivot of a screen-fixed pattern: the fixed point of the
-        # per-frame scaling lands on kpx for every sc (so it radiates from the kernel)
-        # and the anchor carries no view term, so nothing translates when the camera
-        # moves — the kernel only steers where the expansion radiates from.
+        # The clouds are PINNED TO WORLD space: a texel sits at a fixed world (x, y)
+        # and is projected through the camera exactly like the terrain, so panning
+        # slides the clouds across the screen with the world (stationary relative to
+        # the world x/y grid, not to the screen). The world-locked tile origin a0
+        # (world 0,0 -> buffer) carries that pan; on top of it the radial breathing
+        # zoom expands about the kernel's projected screen position kpx. Anchor =
+        # kpx*(1-sc) + a0*sc is scale-about-pivot of the world-locked pattern: the
+        # fixed point of the per-frame scaling lands on kpx for every sc (radiates
+        # from the kernel), while a0 makes the whole thing track world coordinates.
         z = self.zoom
-        vx = cam_x + W * 0.5              # view centre (used only to project kc)
+        sx = z * bw / W                  # buffer px per world unit (x); sy for y
+        sy = z * bh / H
+        vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
         kc = self._kc
         kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
-        kpx = (W * 0.5 + (kcx - vx) * z) * bw / W    # kernel projected to the buffer
-        kpy = (H * 0.5 + (kcy - vy) * z) * bh / H
+        kpx = bw * 0.5 + (kcx - vx) * sx           # kernel projected to the buffer
+        kpy = bh * 0.5 + (kcy - vy) * sy
+        a0x = bw * 0.5 - vx * sx                   # world (0,0) projected to the buffer
+        a0y = bh * 0.5 - vy * sy
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
@@ -678,8 +683,8 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            ax = kpx * (1.0 - sc) + bw * 0.5 * sc   # scale about kpx; screen-locked
-            ay = kpy * (1.0 - sc) + bh * 0.5 * sc
+            ax = kpx * (1.0 - sc) + a0x * sc   # scale about kpx; a0 tracks world x/y
+            ay = kpy * (1.0 - sc) + a0y * sc
             sx0 = ax - T * math.ceil(ax / T)
             sy0 = ay - T * math.ceil(ay / T)
             y = sy0
