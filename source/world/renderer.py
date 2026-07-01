@@ -82,7 +82,8 @@ class Renderer:
                  seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
                  fade_duration=1.4, fade_jitter=0.5, fade_sat=0.5,
-                 fade_near=0.35, sat_dist=1.0, haze=None):
+                 fade_near=0.35, sat_dist=1.0, haze=None,
+                 cloud_front=True, front_colour=None):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.bg = bg
@@ -163,6 +164,29 @@ class Renderer:
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
             self._cloud_big, self._cloud_B = self._build_cloud_big()
+
+        # --- ephemeral cloud-front puffs (main thread; no sampling/Poisson) ---
+        # Off-white soft discs spawned along the leading screen edge as the view
+        # pans, world-anchored so they drift in with the terrain, scaling+fading
+        # in then back out. Pure decoration: a cloud front rolling ahead of the
+        # haze-coloured terrain that resolves behind it. Capped + cached -> cheap.
+        self.cloud_front = cloud_front
+        if cloud_front:
+            hr, hg, hb = self._haze
+            if front_colour is None:                 # lift the haze toward white
+                front_colour = (int(hr + 0.6 * (255 - hr)),
+                                int(hg + 0.6 * (255 - hg)),
+                                int(hb + 0.6 * (255 - hb)))
+            self._front_colour = front_colour
+            self._front_rng = np.random.default_rng(seed + 12345)
+            self._front = []                 # (wx, wy, birth, life, r_px)
+            self._front_cache = {}           # (r_px, alpha) -> soft disc surface
+            self._front_accum = 0.0          # travelled screen px since last spawn
+            self._front_pvc = None           # calibrated on the first draw
+            self._front_alpha = 205
+            self._front_spacing = max(24.0, self.radius * 2.4)  # px between spawns
+            self._front_size = self.radius * 2.4                # base screen radius
+            self._front_cap = 90
 
     # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
@@ -583,6 +607,80 @@ class Renderer:
                 x += B
             y += B
 
+    # --- ephemeral cloud front --------------------------------------------
+    def _cloud_front_pass(self, target, cam, zoom, now):
+        w, h = self.w, self.h
+        vc = (cam[0] + w * 0.5, cam[1] + h * 0.5)
+        if self._front_pvc is None:           # first frame: calibrate, don't spawn
+            self._front_pvc = vc
+            return
+        dvx = vc[0] - self._front_pvc[0]; dvy = vc[1] - self._front_pvc[1]
+        self._front_pvc = vc
+        mag = math.hypot(dvx, dvy)
+        rng = self._front_rng
+        puffs = self._front
+
+        # Spawn along the leading screen edge, one per _front_spacing px travelled.
+        if mag > 1e-6 and len(puffs) < self._front_cap:
+            dx = dvx / mag; dy = dvy / mag        # motion dir = leading edge dir
+            perpx, perpy = -dy, dx
+            half_span = 0.5 * (abs(perpx) * w + abs(perpy) * h)   # edge extent
+            tb = min((w * 0.5) / abs(dx) if abs(dx) > 1e-9 else 1e18,
+                     (h * 0.5) / abs(dy) if abs(dy) > 1e-9 else 1e18)
+            ex = w * 0.5 + dx * tb; ey = h * 0.5 + dy * tb        # edge midpoint
+            self._front_accum += mag * zoom
+            while (self._front_accum >= self._front_spacing
+                   and len(puffs) < self._front_cap):
+                self._front_accum -= self._front_spacing
+                off = (rng.random() * 2.0 - 1.0) * half_span * 0.85
+                depth = rng.random() * 0.05 * max(w, h)          # just past the edge
+                sx = ex + perpx * off + dx * depth
+                sy = ey + perpy * off + dy * depth
+                wx = cam[0] + w * 0.5 + (sx - w * 0.5) / zoom     # anchor in world
+                wy = cam[1] + h * 0.5 + (sy - h * 0.5) / zoom
+                life = 0.7 + rng.random() * 0.9
+                r_px = self._front_size * (0.6 + rng.random() * 0.8)
+                puffs.append((wx, wy, now, life, r_px))
+        else:
+            self._front_accum = 0.0
+
+        if not puffs:
+            return
+        cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
+        fr, fg, fb = self._front_colour
+        amax = self._front_alpha
+        cache = self._front_cache
+        live = []; seq = []
+        for p in puffs:
+            wx, wy, birth, life, base_r = p
+            age = now - birth
+            if age >= life:
+                continue                          # dead
+            live.append(p)
+            env = math.sin(math.pi * age / life)  # 0 -> 1 -> 0 (scale + fade)
+            if env <= 0.02:
+                continue
+            r = int(base_r * env)
+            if r < 1:
+                continue
+            sx = w * 0.5 + (wx - cx) * zoom
+            sy = h * 0.5 + (wy - cy) * zoom
+            if sx < -r or sx > w + r or sy < -r or sy > h + r:
+                continue                          # off-screen: age but don't blit
+            alpha = int(amax * env) & ~7          # 8-step alpha -> tiny cache
+            if alpha <= 0:
+                continue
+            key = (r, alpha)
+            surf = cache.get(key)
+            if surf is None:
+                surf = _make_kernel(r)
+                surf.fill((fr, fg, fb, alpha), special_flags=pygame.BLEND_RGBA_MULT)
+                cache[key] = surf
+            seq.append((surf, (int(sx) - r, int(sy) - r)))
+        self._front = live
+        if seq:
+            target.blits(seq, doreturn=False)
+
     # --- frame ------------------------------------------------------------
     def draw(self, target):
         cam = self._cam
@@ -617,6 +715,9 @@ class Renderer:
             if fading.any():
                 self._blit_fading(target, sx[fading], sy[fading], keys[fading],
                                   comp[fading], dur[fading], grow[fading], now)
+
+        if self.cloud_front:              # cloud front veils the resolving edge
+            self._cloud_front_pass(target, cam, zoom, now)
 
         self._prev_zoom = zoom
         self._prev_now = now
