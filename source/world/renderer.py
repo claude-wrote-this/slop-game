@@ -182,9 +182,8 @@ class Renderer:
             self._front = []                 # (wx, wy, birth, life, r_px)
             self._front_cache = {}           # (r_px, alpha) -> soft disc surface
             self._front_alpha = 140          # low: many small grains overlap
-            self._front_rate = 240.0         # grains/sec at full frontier activity
-            self._front_ref = 250.0          # fading-point count for full rate
-            self._front_cap = 150
+            self._front_rate = 110.0         # grains/sec (constant -> steady cost)
+            self._front_cap = 120
 
     # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
@@ -607,37 +606,39 @@ class Renderer:
 
     # --- ephemeral cloud front --------------------------------------------
     def _spawn_front(self, cam, zoom, now, dt):
-        # Drive the front off the sampler's own activity: the fading points (still
-        # resolving white->haze->terrain) mark the frontier it's working. Scatter
-        # small off-white grains around the youngest of them, continuously in time
-        # so it keeps going while stationary. No sampling — reads point positions.
+        # Drive the front off the sampler's activity: the still-fading points mark
+        # the frontier it's working, and the youngest of them sit on the leading
+        # edge. Spend a *constant* grain budget per second — independent of how many
+        # points are resolving, so the cost is steady and it stays lively whether
+        # the edge is big or small — and scatter it onto those points, weighted to
+        # the youngest. Reads the published position/fade arrays; no sampling.
         puffs = self._front
         if (dt <= 0.0 or now >= self._max_comp        # nothing resolving -> no work
                 or self._P.shape[0] == 0 or len(puffs) >= self._front_cap):
             return
+        fi = np.nonzero(self._C > now)[0]           # fading points (the frontier)
+        if fi.size == 0:
+            return
         w, h = self.w, self.h
         cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
-        rx = (self._P[:, 0] - cx) * zoom
-        ry = (self._P[:, 1] - cy) * zoom
-        on = ((rx > -w * 0.5) & (rx < w * 0.5) & (ry > -h * 0.5) & (ry < h * 0.5)
-              & (self._C > now))                    # fading + on-screen
-        idx = np.nonzero(on)[0]
-        if idx.size == 0:
+        P = self._P
+        rx = (P[fi, 0] - cx) * zoom; ry = (P[fi, 1] - cy) * zoom
+        on = (rx > -w * 0.5) & (rx < w * 0.5) & (ry > -h * 0.5) & (ry < h * 0.5)
+        ci = fi[on]
+        if ci.size == 0:
             return
         rng = self._front_rng
-        # youth in [0,1]: 1 = just born (whitest, furthest out on the frontier)
-        youth = np.clip((self._C[idx] - now) / np.maximum(self._D[idx], 1e-6), 0.0, 1.0)
-        rate = self._front_rate * min(1.0, idx.size / self._front_ref)
-        n = int(rate * dt + rng.random())           # stochastic rounding
+        n = int(self._front_rate * dt + rng.random())    # constant budget
         n = min(n, self._front_cap - len(puffs))
         if n <= 0:
             return
-        wgt = youth * youth + 0.05
+        youth = np.clip((self._C[ci] - now) / np.maximum(self._D[ci], 1e-6), 0.0, 1.0)
+        wgt = youth * youth + 0.03            # bias to the newest == leading edge
         wgt /= wgt.sum()
-        pick = rng.choice(idx.size, size=n, p=wgt)   # bias to the youngest
-        P = self._P; jit = self.poisson_r * 0.6
+        pick = rng.choice(ci.size, size=n, p=wgt)
+        jit = self.poisson_r * 0.7
         for j in pick.tolist():
-            i = idx[j]
+            i = ci[j]
             wx = P[i, 0] + (rng.random() * 2.0 - 1.0) * jit
             wy = P[i, 1] + (rng.random() * 2.0 - 1.0) * jit
             life = 0.5 + rng.random() * 0.8
