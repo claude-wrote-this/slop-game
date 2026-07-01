@@ -651,18 +651,17 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # Parallax driven by the kernel's own world position (self._kc), not the
-        # camera. The terrain scrolls opposite to the kernel's motion, so scrolling
-        # the cloud *with* kc (+kc*pf) sends it opposite to the terrain — a background
-        # that slides against the world instead of riding along with it. kc springs
-        # smoothly and is a plain world coordinate, so there's no camera/zoom coupling.
+        # The cloud is world-fixed and zoomed about the kernel centre (self._kc): a
+        # texel at cloud-world c sits at (c - kc)*scale from the buffer centre. So the
+        # zoom pivots on the kernel (the tile at c=kc never moves as the scale grows),
+        # and as the kernel travels the projection pans exactly opposite to it — the
+        # clouds don't ride with the kernel, they expand outward from it while the
+        # world slides past. The -kc offset scales with the zoom, which is the bit that
+        # matters: pinned flat it rides along. Driven purely by kc, no camera.
         pf = self._cloud_pf
         kc = self._kc
-        if kc is not None:
-            pvx = bw * 0.5 + kc[0] * pf
-            pvy = bh * 0.5 + kc[1] * pf
-        else:
-            pvx, pvy = bw * 0.5, bh * 0.5
+        kcx = kc[0] if kc is not None else 0.0
+        kcy = kc[1] if kc is not None else 0.0
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
@@ -676,9 +675,10 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            # pin a tile corner to the kernel pivot so the zoom emanates from there
-            sx0 = pvx - T * math.ceil(pvx / T)
-            sy0 = pvy - T * math.ceil(pvy / T)
+            ax = bw * 0.5 - kcx * pf * sc      # kernel pivot; -kc*scale pans opposite
+            ay = bh * 0.5 - kcy * pf * sc
+            sx0 = ax - T * math.ceil(ax / T)
+            sy0 = ay - T * math.ceil(ay / T)
             y = sy0
             while y < bh:
                 x = sx0
