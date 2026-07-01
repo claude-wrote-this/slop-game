@@ -652,20 +652,26 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds are centred on the resolved-points centroid and scroll radially
-        # outward from it. But the raw centroid churns: the sampler adds frontier
-        # points and evicts trailing ones each re-arm, and every such change shifts the
-        # centroid by some (dx, dy), dragging the whole texture with it. So each frame
-        # we measure that shift (the centroid delta since last frame) and accumulate
-        # its opposite into _cloud_comp, then add _cloud_comp back onto the centroid:
-        # a +dx shift from evicting and a +dx shift from adding are both cancelled by
-        # -dx, so point churn no longer moves the texture. What remains after the
-        # cancellation projects to (kpx, kpy) and is pinned as a tile lattice point —
-        # the fixed point of the breathing zoom — so tiles grow (sc 1->2) outward from
-        # that centre while the seamless tile hides the loop.
+        # The clouds scroll radially outward from the resolved-points centroid. Two
+        # decoupled references drive it:
+        #   * the ZOOM PIVOT (the fixed point the breathing expands from) follows the
+        #     REAL centroid, so the outward flow always radiates from where the terrain
+        #     is actually resolving and tracks it as you move;
+        #   * the TRANSLATION ANCHOR uses the churn-cancelled centroid, so the texture
+        #     itself does not jitter with the sampler. The raw centroid churns — the
+        #     sampler adds frontier points and evicts trailing ones each re-arm, each
+        #     shift (dx, dy) dragging the texture — so we accumulate the opposite of the
+        #     per-frame centroid delta into _cloud_comp and add it back, cancelling the
+        #     add/evict shifts.
+        # Anchor ax = pivot*(1-sc) + a0*sc is scale-about-pivot: the fixed point of the
+        # sc-scaling lands on the real-centroid pivot, while at the reference scale the
+        # pattern sits at the churn-free anchor a0, so tiles grow (sc 1->2) outward from
+        # the live centroid without the texture juddering as points resolve.
         z = self.zoom
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
+        sxw = z * bw / W                 # buffer px per world unit
+        syw = z * bh / H
         P = self._P
         c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
         if self._cloud_c_prev is None:
@@ -674,10 +680,12 @@ class Renderer:
         self._cloud_comp = (self._cloud_comp[0] - (c[0] - self._cloud_c_prev[0]),
                             self._cloud_comp[1] - (c[1] - self._cloud_c_prev[1]))
         self._cloud_c_prev = c
-        rcx = c[0] + self._cloud_comp[0]
+        rcx = c[0] + self._cloud_comp[0]         # churn-cancelled centre (translation)
         rcy = c[1] + self._cloud_comp[1]
-        kpx = bw * 0.5 + (rcx - vx) * z * bw / W    # resolved centre projected to buffer
-        kpy = bh * 0.5 + (rcy - vy) * z * bh / H
+        pvx = bw * 0.5 + (c[0] - vx) * sxw       # real centroid -> zoom pivot
+        pvy = bh * 0.5 + (c[1] - vy) * syw
+        a0x = bw * 0.5 + (rcx - vx) * sxw        # churn-free centre -> translation anchor
+        a0y = bh * 0.5 + (rcy - vy) * syw
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
@@ -691,10 +699,12 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            # tile from the lattice point that keeps (kpx, kpy) fixed as T grows, so
-            # the pattern expands outward from the kernel centre.
-            sx0 = kpx - T * math.ceil(kpx / T)
-            sy0 = kpy - T * math.ceil(kpy / T)
+            # pivot on the real centroid, translate by the churn-free anchor, then tile
+            # from the lattice point so the pattern expands outward from the live centre.
+            ax = pvx * (1.0 - sc) + a0x * sc
+            ay = pvy * (1.0 - sc) + a0y * sc
+            sx0 = ax - T * math.ceil(ax / T)
+            sy0 = ay - T * math.ceil(ay / T)
             y = sy0
             while y < bh:
                 x = sx0
