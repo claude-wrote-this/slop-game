@@ -159,6 +159,8 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
+            self._cloud_c = None         # smoothed resolved-points centre (world)
+            self._cloud_ck = 0.08        # per-frame follow rate for that centre
             self._cloud_big, self._cloud_B = self._build_cloud_big()
             self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
@@ -654,22 +656,29 @@ class Renderer:
         # outward from it. That centre is the centroid of the resolved points, not the
         # kernel: the kernel roams *around* the disc of points, so its position lags
         # and orbits, whereas the mean of the points sits at the middle of the
-        # resolved region and barely moves as a few frontier points resolve or fade
-        # (an average over thousands is far steadier than a bbox/hull extent). It is
-        # projected to the buffer as (kpx, kpy) and pinned as a tile lattice point, so
-        # it is the fixed point of the breathing zoom: as the tiles grow (sc 1->2)
-        # every texel flows outward from the resolved centre, and the crossfading
-        # second layer (half a phase ahead, each fading to zero at its own reset)
-        # hides the loop. The tile wraps seamlessly, so as the centre drifts the
-        # lattice slides under it without any visible seam.
+        # resolved region. But the raw mean lurches: the sampler evicts trailing
+        # points beyond kernel_r in discrete batches (off-screen), so the centroid
+        # jumps each time the disc "catches up" to the kernel. Exactly cancelling that
+        # cull shift would drift unboundedly — culling and refilling are two halves of
+        # the same tracking motion, so cancelling only the cull half leaves the centre
+        # falling ever further behind. Instead follow the raw centroid with a critically
+        # damped step (_cloud_ck): the batch lurch is smoothed to a gentle slide, the
+        # lag stays bounded, and it settles onto the true centroid whenever panning
+        # stops. The result projects to (kpx, kpy) and is pinned as a tile lattice
+        # point, the fixed point of the breathing zoom, so tiles grow (sc 1->2) outward
+        # from the resolved centre while the seamless tile hides the loop and the slide.
         z = self.zoom
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
         P = self._P
-        if P.shape[0]:
-            rcx, rcy = float(P[:, 0].mean()), float(P[:, 1].mean())   # resolved centre
+        target_c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
+        if self._cloud_c is None:
+            self._cloud_c = target_c
         else:
-            rcx, rcy = vx, vy
+            cx0, cy0 = self._cloud_c
+            self._cloud_c = (cx0 + (target_c[0] - cx0) * self._cloud_ck,
+                             cy0 + (target_c[1] - cy0) * self._cloud_ck)
+        rcx, rcy = self._cloud_c
         kpx = bw * 0.5 + (rcx - vx) * z * bw / W    # resolved centre projected to buffer
         kpy = bh * 0.5 + (rcy - vy) * z * bh / H
         base = self._cloud_zt; B = self._cloud_zB
