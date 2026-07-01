@@ -159,7 +159,23 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
+            self._cloud_piv = None       # spring-smoothed real centroid (zoom centre)
+            self._cloud_pivk = 0.15      # centre spring rate per frame (de-jitter)
+            self._cloud_layers = None    # [[scale, ox, oy], ...] accumulated zoom state
             self._cloud_big, self._cloud_B = self._build_cloud_big()
+            self._cloud_zrate = 0.0035   # radial-zoom doublings per frame (outward flow)
+            self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
+                               int(255 - cloud_depth * 0.7))   # clear-sky fill
+            # The radial zoom is scale-heavy, so render it to a half-res buffer (the
+            # cloud is low-frequency, upscaling is invisible) and blow it up once.
+            zf = 0.4
+            self._cloud_buf = pygame.Surface((max(1, int(screen_w * zf)),
+                                              max(1, int(screen_h * zf))))
+            self._cloud_zB = max(1, int(round(self._cloud_B * zf)))
+            # smoothscale (bilinear) so the aliased draw.circle edges soften as the
+            # tile is downsized, rather than carrying their jaggies into the buffer.
+            self._cloud_zt = pygame.transform.smoothscale(
+                self._cloud_big, (self._cloud_zB, self._cloud_zB))
             # one shared cloud palette (blue-white by cloud shade, billow 0..1) that
             # the background, the puffs and the new-point haze all draw from, so they
             # match rather than being independently tinted.
@@ -630,19 +646,82 @@ class Renderer:
         return big, B
 
     def _cloud_background(self, target, cam_x, cam_y):
-        B = self._cloud_B
-        s = self.cloud_scale
-        dx, dy = self.cloud_drift
-        ox = int(round(cam_x + self.cloud_t * dx / s)) % B
-        oy = int(round(cam_y + self.cloud_t * dy / s)) % B
-        big = self._cloud_big
-        y = -oy
-        while y < self.h:
-            x = -ox
-            while x < self.w:
-                target.blit(big, (x, y))
-                x += B
-            y += B
+        # Radial outward drift: the cloud tile slowly zooms out from the kernel
+        # centre (screen centre) so texels flow outward — reads as descending into
+        # the clouds, far more convincing than a flat horizontal pan. A single zoom
+        # would pop when it resets, so two layers run half a phase apart and
+        # crossfade (each fades to zero at its own reset), giving a seamless loop.
+        W, H = self.w, self.h
+        buf = self._cloud_buf
+        bw, bh = buf.get_size()
+        buf.fill(self._cloud_sky)             # sky under the crossfading layers
+        # The clouds scroll radially outward from the resolved-points centroid. The
+        # zoom is ACCUMULATED, not recomputed from an absolute pivot: each frame every
+        # layer is nudged by one small zoom step about the current centre. A texel's
+        # offset o thus integrates o <- o*df + centre*(1-df); a moving centre only
+        # changes the next step's direction and can never retroactively translate the
+        # already-accumulated pattern, so when the centre shifts the texture keeps its
+        # place and the outward flow simply resumes from the new centre. (A closed-form
+        # scale-about-pivot instead ties position to the pivot as pivot*(1-sc), so
+        # moving the pivot slides the whole texture — the artefact this replaces.)
+        # The centre is the sprung real centroid; the per-frame step is tiny, so its
+        # jitter and churn are heavily low-passed into the offset. Two layers run half a
+        # doubling apart and crossfade, each halving its scale+offset about the centre at
+        # sc>=2 (hidden while its alpha is ~0), giving a seamless endless zoom.
+        z = self.zoom
+        vx = cam_x + W * 0.5             # view centre in world
+        vy = cam_y + H * 0.5
+        sxw = z * bw / W                 # buffer px per world unit
+        syw = z * bh / H
+        P = self._P
+        c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
+        # spring the centroid so the zoom centre glides instead of twitching on churn
+        if self._cloud_piv is None:
+            self._cloud_piv = c
+        else:
+            px0, py0 = self._cloud_piv
+            self._cloud_piv = (px0 + (c[0] - px0) * self._cloud_pivk,
+                               py0 + (c[1] - py0) * self._cloud_pivk)
+        pcx, pcy = self._cloud_piv
+        pvx = bw * 0.5 + (pcx - vx) * sxw        # zoom centre, projected to the buffer
+        pvy = bh * 0.5 + (pcy - vy) * syw
+        base = self._cloud_zt; B = self._cloud_zB
+        df = 2.0 ** self._cloud_zrate            # per-frame zoom factor (outward flow)
+        if self._cloud_layers is None:           # seed two layers half a doubling apart
+            self._cloud_layers = [[1.0, pvx, pvy], [math.sqrt(2.0), pvx, pvy]]
+        for layer in self._cloud_layers:
+            sc, ox, oy = layer
+            sc *= df                             # accumulate the zoom about the centre
+            ox = ox * df + pvx * (1.0 - df)
+            oy = oy * df + pvy * (1.0 - df)
+            if sc >= 2.0:                         # seamless reset: halve scale + offset
+                sc *= 0.5
+                ox = pvx + (ox - pvx) * 0.5
+                oy = pvy + (oy - pvy) * 0.5
+            layer[0], layer[1], layer[2] = sc, ox, oy
+            phase = math.log2(sc)                # 0 -> 1 across one doubling
+            # boosted so the two layers stay near-opaque through the crossfade (no
+            # brightness pulse) while still fading to zero at each layer's reset.
+            alpha = min(255, int(357.0 * math.sin(math.pi * phase)))
+            if alpha < 4:
+                continue
+            T = max(1, int(round(B * sc)))
+            scaled = pygame.transform.smoothscale(base, (T, T))
+            scaled.set_alpha(alpha)
+            sx0 = ox - T * math.ceil(ox / T)     # tile from the lattice point at o
+            sy0 = oy - T * math.ceil(oy / T)
+            y = sy0
+            while y < bh:
+                x = sx0
+                while x < bw:
+                    buf.blit(scaled, (int(x), int(y)))
+                    x += T
+                y += T
+        # smoothscale the final upscale: the ~2.5x blow-up of the low-res buffer is
+        # where the circle edges read as blocky, and bilinear turns them into soft
+        # gradients. This is the dominant AA win; the tile-scale smoothing above just
+        # keeps the per-tile magnification from re-introducing hard edges.
+        pygame.transform.smoothscale(buf, (self.w, self.h), target)   # upscale once
 
     # --- ephemeral cloud front --------------------------------------------
     def _spawn_front(self, cam, zoom, now, dt):
