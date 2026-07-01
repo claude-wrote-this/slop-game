@@ -68,3 +68,54 @@ class _Perlin3:
         y1 = lerp(x1, x2, v)
         y2 = lerp(x3, x4, v)
         return lerp(y1, y2, w)                   # roughly [-1, 1]
+
+    @staticmethod
+    def _dfade(t):
+        # derivative of the quintic fade: 30 t^2 (t-1)^2
+        return 30.0 * t * t * (t - 1.0) * (t - 1.0)
+
+    def noised(self, x, y, z):
+        """3D value noise in [-1, 1] with its analytic gradient, returned as
+        (value, d/dx, d/dy, d/dz). Value noise (random value per lattice corner,
+        quintic-interpolated) rather than gradient noise, because its derivative is
+        exact and cheap — corner values are constants, so only the fade weights
+        differentiate. Feeds the derivative-damped ("erosion") fBm."""
+        x, y, z = np.broadcast_arrays(np.asarray(x, float),
+                                      np.asarray(y, float),
+                                      np.asarray(z, float))
+        x0, y0, z0 = np.floor(x), np.floor(y), np.floor(z)
+        xi = x0.astype(np.int64) & 255
+        yi = y0.astype(np.int64) & 255
+        zi = z0.astype(np.int64) & 255
+        fx, fy, fz = x - x0, y - y0, z - z0
+        ux, uy, uz = self._fade(fx), self._fade(fy), self._fade(fz)
+        dux, duy, duz = self._dfade(fx), self._dfade(fy), self._dfade(fz)
+        p = self.perm
+
+        A = p[xi] + yi; B = p[xi + 1] + yi
+        AA, AB = p[A] + zi, p[A + 1] + zi
+        BA, BB = p[B] + zi, p[B + 1] + zi
+
+        def val(idx):
+            return p[idx].astype(np.float64) * (2.0 / 255.0) - 1.0
+
+        v000 = val(AA);     v100 = val(BA);     v010 = val(AB);     v110 = val(BB)
+        v001 = val(AA + 1); v101 = val(BA + 1); v011 = val(AB + 1); v111 = val(BB + 1)
+
+        # Multilinear form value = a + b ux + c uy + d uz + e ux uy + f ux uz
+        #                              + g uy uz + h ux uy uz, differentiated exactly.
+        a = v000
+        b = v100 - v000
+        c = v010 - v000
+        d = v001 - v000
+        e = v000 - v100 - v010 + v110
+        f = v000 - v100 - v001 + v101
+        g = v000 - v010 - v001 + v011
+        h = -v000 + v100 + v010 + v001 - v110 - v101 - v011 + v111
+
+        value = (a + b * ux + c * uy + d * uz + e * ux * uy + f * ux * uz
+                 + g * uy * uz + h * ux * uy * uz)
+        ddx = dux * (b + e * uy + f * uz + h * uy * uz)
+        ddy = duy * (c + e * ux + g * uz + h * ux * uz)
+        ddz = duz * (d + f * ux + g * uy + h * ux * uy)
+        return value, ddx, ddy, ddz
