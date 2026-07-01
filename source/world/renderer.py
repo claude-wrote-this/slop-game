@@ -161,6 +161,7 @@ class Renderer:
             self.cloud_t = 0.0
             self._cloud_big, self._cloud_B = self._build_cloud_big()
             self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
+            self._cloud_pf = 0.25        # parallax: clouds pan opposite to view motion
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
                                int(255 - cloud_depth * 0.7))   # clear-sky fill
             # The radial zoom is scale-heavy, so render it to a half-res buffer (the
@@ -650,16 +651,22 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # Pivot on the kernel centre (where terrain generates), not the screen
-        # centre — the two differ when the view outruns the sampler, and the clouds
-        # should part around the kernel. Project kc to screen, then to buffer coords.
+        # The zoom emanates from the kernel centre (where terrain generates), but the
+        # cloud field is world-attached: it pans *opposite* to the kernel's motion
+        # (parallax) rather than riding along with it, while keeping its outward
+        # drift. So: project kc to screen for the pivot, then translate the whole
+        # pattern by -cam*parallax. (Periodic tiling, so the pivot corner stays near
+        # the kernel and the translation just slides the pattern.)
         kc = self._kc
+        z = self.zoom
         if kc is not None:
-            z = self.zoom
-            pvx = (W * 0.5 + (kc[0] - (cam_x + W * 0.5)) * z) * bw / W
-            pvy = (H * 0.5 + (kc[1] - (cam_y + H * 0.5)) * z) * bh / H
+            kx = W * 0.5 + (kc[0] - (cam_x + W * 0.5)) * z
+            ky = H * 0.5 + (kc[1] - (cam_y + H * 0.5)) * z
         else:
-            pvx, pvy = bw * 0.5, bh * 0.5
+            kx, ky = W * 0.5, H * 0.5
+        pf = self._cloud_pf
+        pvx = (kx - cam_x * pf) * bw / W       # kernel pivot + world-parallax
+        pvy = (ky - cam_y * pf) * bh / H
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
