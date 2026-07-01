@@ -424,8 +424,11 @@ class Renderer:
     def _blit_fading(self, target, sx, sy, keys, comp, dur, now):
         prog = np.clip(1.0 - (comp - now) / dur, 0.0, 1.0)   # per-point fade length
         lv = (prog * self._FADE_LEVELS).astype(np.int32)
-        xs = sx.tolist(); ys = sy.tolist()
-        keys = keys.tolist(); lv = lv.tolist()
+        # Draw oldest (most-resolved) first, newest (whitest) last, so the young
+        # white points stay on top rather than resolved ones poking through them.
+        order = np.argsort(lv)[::-1]
+        xs = sx[order].tolist(); ys = sy[order].tolist()
+        keys = keys[order].tolist(); lv = lv[order].tolist()
         cache = self._fade
         for i in range(len(xs)):
             p = lv[i]
