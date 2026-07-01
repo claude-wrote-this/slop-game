@@ -160,6 +160,17 @@ class Renderer:
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
             self._cloud_big, self._cloud_B = self._build_cloud_big()
+            self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
+            self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
+                               int(255 - cloud_depth * 0.7))   # clear-sky fill
+            # The radial zoom is scale-heavy, so render it to a half-res buffer (the
+            # cloud is low-frequency, upscaling is invisible) and blow it up once.
+            zf = 0.4
+            self._cloud_buf = pygame.Surface((max(1, int(screen_w * zf)),
+                                              max(1, int(screen_h * zf))))
+            self._cloud_zB = max(1, int(round(self._cloud_B * zf)))
+            self._cloud_zt = pygame.transform.scale(
+                self._cloud_big, (self._cloud_zB, self._cloud_zB))
             # one shared cloud palette (blue-white by cloud shade, billow 0..1) that
             # the background, the puffs and the new-point haze all draw from, so they
             # match rather than being independently tinted.
@@ -630,19 +641,38 @@ class Renderer:
         return big, B
 
     def _cloud_background(self, target, cam_x, cam_y):
-        B = self._cloud_B
-        s = self.cloud_scale
-        dx, dy = self.cloud_drift
-        ox = int(round(cam_x + self.cloud_t * dx / s)) % B
-        oy = int(round(cam_y + self.cloud_t * dy / s)) % B
-        big = self._cloud_big
-        y = -oy
-        while y < self.h:
-            x = -ox
-            while x < self.w:
-                target.blit(big, (x, y))
-                x += B
-            y += B
+        # Radial outward drift: the cloud tile slowly zooms out from the kernel
+        # centre (screen centre) so texels flow outward — reads as descending into
+        # the clouds, far more convincing than a flat horizontal pan. A single zoom
+        # would pop when it resets, so two layers run half a phase apart and
+        # crossfade (each fades to zero at its own reset), giving a seamless loop.
+        buf = self._cloud_buf
+        bw, bh = buf.get_size()
+        buf.fill(self._cloud_sky)             # sky under the crossfading layers
+        base = self._cloud_zt; B = self._cloud_zB
+        t = self.cloud_t * self._cloud_zrate
+        for k in (0.0, 0.5):
+            phase = (t + k) % 1.0
+            # boosted so the two layers stay near-opaque through the crossfade (no
+            # brightness pulse) while still fading to zero at each layer's reset.
+            alpha = min(255, int(357.0 * math.sin(math.pi * phase)))
+            if alpha < 4:
+                continue
+            sc = 2.0 ** phase                 # 1 -> 2: texels move away from centre
+            T = max(1, int(round(B * sc)))
+            scaled = pygame.transform.scale(base, (T, T))
+            scaled.set_alpha(alpha)
+            # pin a tile corner to the buffer centre so the zoom pivots on the kernel
+            sx0 = bw * 0.5 - T * math.ceil(bw * 0.5 / T)
+            sy0 = bh * 0.5 - T * math.ceil(bh * 0.5 / T)
+            y = sy0
+            while y < bh:
+                x = sx0
+                while x < bw:
+                    buf.blit(scaled, (int(x), int(y)))
+                    x += T
+                y += T
+        pygame.transform.scale(buf, (self.w, self.h), target)   # upscale once
 
     # --- ephemeral cloud front --------------------------------------------
     def _spawn_front(self, cam, zoom, now, dt):
