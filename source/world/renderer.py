@@ -651,9 +651,7 @@ class Renderer:
             wx = P[i, 0] + ux * off + (rng.random() * 2.0 - 1.0) * jit
             wy = P[i, 1] + uy * off + (rng.random() * 2.0 - 1.0) * jit
             life = 0.5 + rng.random() * 0.8
-            t = rng.random()                         # t^2 -> mostly small grains
-            r_px = self.radius * (0.4 + t * t * 1.6)
-            puffs.append((wx, wy, now, life, r_px))
+            puffs.append((wx, wy, now, life, self.radius))   # standard point size
 
     def _cloud_front_pass(self, target, cam, zoom, now):
         w, h = self.w, self.h
