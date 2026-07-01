@@ -181,14 +181,10 @@ class Renderer:
             self._front_rng = np.random.default_rng(seed + 12345)
             self._front = []                 # (wx, wy, birth, life, r_px)
             self._front_cache = {}           # (r_px, alpha) -> soft disc surface
-            self._front_accum = 0.0          # travelled screen px since last spawn
-            self._front_pvc = None           # calibrated on the first draw
-            self._front_alpha = 205
-            self._front_dir = None               # smoothed motion / edge normal
-            self._front_spacing = max(12.0, self.radius * 1.1)  # px travelled/spawn
-            self._front_size = self.radius * 2.0                # base screen radius
-            self._front_bins = 18                # columns across the leading edge
-            self._front_cap = 90
+            self._front_alpha = 140          # low: many small grains overlap
+            self._front_rate = 240.0         # grains/sec at full frontier activity
+            self._front_ref = 250.0          # fading-point count for full rate
+            self._front_cap = 150
 
     # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
@@ -610,89 +606,52 @@ class Renderer:
             y += B
 
     # --- ephemeral cloud front --------------------------------------------
-    def _spawn_front(self, cam, zoom, now, mag):
+    def _spawn_front(self, cam, zoom, now, dt):
+        # Drive the front off the sampler's own activity: the fading points (still
+        # resolving white->haze->terrain) mark the frontier it's working. Scatter
+        # small off-white grains around the youngest of them, continuously in time
+        # so it keeps going while stationary. No sampling — reads point positions.
         puffs = self._front
-        if (self._front_dir is None or mag <= 1e-6
+        if (dt <= 0.0 or now >= self._max_comp        # nothing resolving -> no work
                 or self._P.shape[0] == 0 or len(puffs) >= self._front_cap):
-            self._front_accum = 0.0
             return
         w, h = self.w, self.h
-        rng = self._front_rng
-        dirx, diry = self._front_dir
-        perpx, perpy = -diry, dirx
         cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
-
-        # project every live point; keep the on-screen ones
         rx = (self._P[:, 0] - cx) * zoom
         ry = (self._P[:, 1] - cy) * zoom
-        on = (rx > -(w * 0.5 + 30)) & (rx < w * 0.5 + 30) \
-            & (ry > -(h * 0.5 + 30)) & (ry < h * 0.5 + 30)
-        if not on.any():
-            self._front_accum = 0.0
+        on = ((rx > -w * 0.5) & (rx < w * 0.5) & (ry > -h * 0.5) & (ry < h * 0.5)
+              & (self._C > now))                    # fading + on-screen
+        idx = np.nonzero(on)[0]
+        if idx.size == 0:
             return
-        rx = rx[on]; ry = ry[on]
-        u = rx * dirx + ry * diry            # along motion (+ = leading)
-        v = rx * perpx + ry * perpy          # across the front
-        U = 0.5 * (abs(dirx) * w + abs(diry) * h)   # screen half-extent along dir
-        V = 0.5 * (abs(perpx) * w + abs(perpy) * h)
-
-        nb = self._front_bins
-        edges = np.linspace(-V, V, nb + 1)
-        b = np.clip(np.digitize(v, edges) - 1, 0, nb - 1)
-        lead = np.full(nb, -1e18)            # leading-most point per column
-        np.maximum.at(lead, b, u)
-        # columns whose terrain stops short of the screen edge => sharp edge to hide
-        short = np.nonzero((lead > -1e17) & (lead < U - 12.0))[0]
-        if short.size == 0:
-            self._front_accum = 0.0
+        rng = self._front_rng
+        # youth in [0,1]: 1 = just born (whitest, furthest out on the frontier)
+        youth = np.clip((self._C[idx] - now) / np.maximum(self._D[idx], 1e-6), 0.0, 1.0)
+        rate = self._front_rate * min(1.0, idx.size / self._front_ref)
+        n = int(rate * dt + rng.random())           # stochastic rounding
+        n = min(n, self._front_cap - len(puffs))
+        if n <= 0:
             return
-
-        self._front_accum += mag * zoom
-        n_spawn = int(self._front_accum // self._front_spacing)
-        self._front_accum -= n_spawn * self._front_spacing
-        bw = edges[1] - edges[0]
-        for _ in range(min(n_spawn, self._front_cap - len(puffs))):
-            col = int(short[rng.integers(0, short.size)])
-            vv = edges[col] + (0.15 + 0.7 * rng.random()) * bw
-            uu = min(U, lead[col] + rng.random() * self._front_size * 0.7)
-            sx = w * 0.5 + uu * dirx + vv * perpx     # back to screen
-            sy = h * 0.5 + uu * diry + vv * perpy
-            wx = cx + (sx - w * 0.5) / zoom           # anchor in world
-            wy = cy + (sy - h * 0.5) / zoom
-            life = 0.7 + rng.random() * 0.9
-            t = rng.random()                          # t^2 skews the mix toward small
-            r_px = self._front_size * (0.18 + t * t * 1.5)
+        wgt = youth * youth + 0.05
+        wgt /= wgt.sum()
+        pick = rng.choice(idx.size, size=n, p=wgt)   # bias to the youngest
+        P = self._P; jit = self.poisson_r * 0.6
+        for j in pick.tolist():
+            i = idx[j]
+            wx = P[i, 0] + (rng.random() * 2.0 - 1.0) * jit
+            wy = P[i, 1] + (rng.random() * 2.0 - 1.0) * jit
+            life = 0.5 + rng.random() * 0.8
+            t = rng.random()                         # t^2 -> mostly small grains
+            r_px = self.radius * (0.4 + t * t * 1.6)
             puffs.append((wx, wy, now, life, r_px))
 
     def _cloud_front_pass(self, target, cam, zoom, now):
         w, h = self.w, self.h
-        vc = (cam[0] + w * 0.5, cam[1] + h * 0.5)
-        if self._front_pvc is None:           # first frame: calibrate, don't spawn
-            self._front_pvc = vc
-            return
-        dvx = vc[0] - self._front_pvc[0]; dvy = vc[1] - self._front_pvc[1]
-        self._front_pvc = vc
-        mag = math.hypot(dvx, dvy)
-        rng = self._front_rng
+        dt = now - self._prev_now
+        dt = 0.0 if dt < 0.0 else min(dt, 0.05)      # clamp (first frame / stalls)
+        self._spawn_front(cam, zoom, now, dt)
+
         puffs = self._front
-
-        # Track a smoothed motion direction (the leading edge normal).
-        if mag > 1e-6:
-            d = (dvx / mag, dvy / mag)
-            if self._front_dir is None:
-                self._front_dir = d
-            else:
-                fx, fy = self._front_dir
-                fx += (d[0] - fx) * 0.25; fy += (d[1] - fy) * 0.25
-                n = math.hypot(fx, fy) or 1.0
-                self._front_dir = (fx / n, fy / n)
-
-        # Lay the soft off-white fringe just beyond the terrain's on-screen leading
-        # boundary, but only in the columns where the generated points fall short of
-        # the screen edge — i.e. where the sampler is behind and a sharp saturated
-        # edge is showing. Reads the points' own screen positions; no sampling.
-        self._spawn_front(cam, zoom, now, mag)
-
         if not puffs:
             return
         cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
