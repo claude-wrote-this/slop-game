@@ -181,7 +181,7 @@ class Renderer:
             self._front_rng = np.random.default_rng(seed + 12345)
             self._front = []                 # (wx, wy, birth, life, r_px)
             self._front_cache = {}           # (r_px, alpha) -> soft disc surface
-            self._front_alpha = 140          # low: many small grains overlap
+            self._front_alpha = 255          # grains reach full opacity mid-life
             self._front_white = 180          # target white cover: resolving pts + puffs
             self._front_fill = 260.0         # max puffs/sec ramp toward the target
             self._front_cap = 120
@@ -675,7 +675,7 @@ class Renderer:
             if age >= life:
                 continue                          # dead
             live.append(p)
-            env = math.sin(math.pi * age / life)  # 0 -> 1 -> 0 (scale + fade)
+            env = math.sin(math.pi * age / life)  # 0 -> 1 -> 0 (scale)
             if env <= 0.02:
                 continue
             r = int(base_r * env)
@@ -685,7 +685,8 @@ class Renderer:
             sy = h * 0.5 + (wy - cy) * zoom
             if sx < -r or sx > w + r or sy < -r or sy > h + r:
                 continue                          # off-screen: age but don't blit
-            alpha = int(amax * env) & ~7          # 8-step alpha -> tiny cache
+            aenv = env * 1.7                      # reach full opacity over the middle
+            alpha = amax if aenv >= 1.0 else (int(amax * aenv) & ~7)  # of its life
             if alpha <= 0:
                 continue
             key = (r, alpha)
