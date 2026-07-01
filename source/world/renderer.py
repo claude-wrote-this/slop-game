@@ -81,7 +81,7 @@ class Renderer:
                  explore_p=0.04, explore_reach=8.0,
                  seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
-                 fade_duration=1.4, fade_jitter=0.5, fade_sat=0.5,
+                 fade_duration=3.0, fade_jitter=0.9, fade_sat=0.5,
                  fade_near=0.35, sat_dist=1.0, haze=None,
                  cloud_front=True, front_colour=None):
         self.w, self.h = screen_w, screen_h
@@ -165,6 +165,15 @@ class Renderer:
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
             self._cloud_big, self._cloud_B = self._build_cloud_big()
+            # one shared cloud palette (blue-white by cloud shade, billow 0..1) that
+            # the background, the puffs and the new-point haze all draw from, so they
+            # match rather than being independently tinted.
+            N = 8
+            self._cloud_pal = [
+                (int(255 - (1.0 - bb) * cloud_depth),
+                 int(255 - (1.0 - bb) * cloud_depth),
+                 int(255 - (1.0 - bb) * cloud_depth * 0.7))
+                for bb in (k / (N - 1) for k in range(N))]
 
         # --- ephemeral cloud-front puffs (main thread; no sampling/Poisson) ---
         # Off-white soft discs spawned along the leading screen edge as the view
@@ -183,22 +192,14 @@ class Renderer:
             self._front = []                 # (wx, wy, birth, life, r_px, cidx)
             self._front_cache = {}           # (r_px, alpha, cidx) -> soft disc surface
             self._front_alpha = 255          # grains reach full opacity mid-life
-            self._front_white = 240          # target white cover: resolving pts + puffs
+            self._front_white = 240          # target white cover: white pts + puffs
+            self._front_white_rf = 0.5       # a point counts as white while rf > this
             self._front_fill = 260.0         # max puffs/sec ramp toward the target
             self._front_cap = 150
-            # palette: subtle blue-white variation (like the cloud bg, but gentler),
-            # indexed by the cloud shade sampled under each puff so it varies the
-            # same way the background does.
-            K = 6
-            if cloud:
-                dd = self.cloud_depth * 0.5
-                self._front_pal = [
-                    (lambda sh: (sh, sh, int(255 - (1.0 - bb) * dd * 0.7)))(
-                        int(255 - (1.0 - bb) * dd))
-                    for bb in (0.55 + 0.45 * k / (K - 1) for k in range(K))]
-            else:
-                self._front_pal = [front_colour] * K
-            self._front_K = K
+            # puffs draw from the shared cloud palette, indexed by the cloud shade
+            # sampled under each, so they vary exactly the way the background does.
+            self._front_pal = self._cloud_pal if cloud else [front_colour]
+            self._front_K = len(self._front_pal)
 
     # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
@@ -508,13 +509,14 @@ class Renderer:
         r2 = max(1, int(round(self._scaled_r * grow)))
         ker = _make_kernel(r2)
         r = ck >> 16; g = (ck >> 8) & 0xFF; b = ck & 0xFF
-        hr, hg, hb = self._haze                       # colour = lerp(haze, terrain, sat)
-        # vary the haze subtly per point (keyed by ck, already in the cache) so new
-        # points read as a gentle blue-white spread rather than a flat white.
-        dv = self.cloud_depth if self.cloud else 0
-        off = (((ck * 2654435761) >> 16) & 0x3f) / 63.0    # 0..1, stable per ck
-        off = (1.0 - off) * dv * 0.3
-        hr = max(0, hr - off); hg = max(0, hg - off); hb = max(0, hb - off * 0.6)
+        # new points start from a cloud-palette colour (matching the background)
+        # picked by a stable hash of their colour key, which is already in the cache
+        # key so this adds no cache entries; then lerp haze -> terrain over sat.
+        if self.cloud:
+            pal = self._cloud_pal
+            hr, hg, hb = pal[((ck * 2654435761) >> 16) % len(pal)]
+        else:
+            hr, hg, hb = self._haze
         cr = int(hr + sat * (r - hr))
         cg = int(hg + sat * (g - hg))
         cb = int(hb + sat * (b - hb))
@@ -674,7 +676,12 @@ class Renderer:
         if (dt <= 0.0 or now >= self._max_comp        # nothing resolving -> no work
                 or self._P.shape[0] == 0 or len(puffs) >= self._front_cap):
             return
-        fi = np.nonzero(self._C > now)[0]           # resolving (white) points
+        # Count only the still-*white* resolving points: a point past the first
+        # part of its fade is mostly terrain colour, not white cover. (Matters now
+        # the fade is slow — otherwise the many half-resolved points would zero the
+        # budget.) rf = 1 at birth -> 0 when done.
+        rf = (self._C - now) / np.maximum(self._D, 1e-6)
+        fi = np.nonzero(rf > self._front_white_rf)[0]
         if fi.size == 0:
             return
         w, h = self.w, self.h
@@ -683,7 +690,7 @@ class Renderer:
         rx = (P[fi, 0] - cx) * zoom; ry = (P[fi, 1] - cy) * zoom
         on = (rx > -w * 0.5) & (rx < w * 0.5) & (ry > -h * 0.5) & (ry < h * 0.5)
         ci = fi[on]
-        # puffs + resolving points -> a constant white budget
+        # puffs + white resolving points -> a constant white budget
         target = self._front_white - ci.size
         target = 0 if target < 0 else min(target, self._front_cap)
         deficit = target - len(puffs)
