@@ -43,7 +43,7 @@ class GameScene(Scene):
         self.zoom = max(self.zoom_min, min(self.zoom_max, 1.0))   # start in range
         self.zoom_target = self.zoom            # gestures set this; zoom eases toward it
         self._zoom_focus = None                 # screen point kept fixed while zooming
-        self._zoom_rate = 9.0                   # max zoom change factor per second
+        self._zoom_rate = 8.0                   # max zoom change factor per second
         self._drag = None                       # mouse/single-finger pan anchor
         self._fingers = {}                      # finger_id -> (px, py) in pixels
         self._pinch_dist = None                 # last two-finger separation
