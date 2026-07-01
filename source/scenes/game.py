@@ -33,12 +33,12 @@ class GameScene(Scene):
         self.terrain = world.get("terrain")     # unused by the static renderer
         self.renderer = world["renderer"]
         self.cam_x, self.cam_y = world["cam"]   # world-space top-left at zoom 1
-        self.zoom = 1.0
         # Clamp zoom-out so the screen diagonal stays within ~2/3 of the kernel
         # disc's diameter — the view never pans/zooms past generated terrain.
         diag = math.hypot(config.SCREEN_W, config.SCREEN_H)
         self.zoom_min = 3.0 * diag / (4.0 * self.renderer.kernel_r)
         self.zoom_max = 8.0
+        self.zoom = max(self.zoom_min, min(self.zoom_max, 1.0))   # start in range
         self._drag = None                       # mouse/single-finger pan anchor
         self._fingers = {}                      # finger_id -> (px, py) in pixels
         self._pinch_dist = None                 # last two-finger separation

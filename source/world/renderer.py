@@ -77,7 +77,8 @@ def _make_cloud_tex(size, seed):
 
 class Renderer:
     def __init__(self, screen_w, screen_h, *, terrain, tile=16,
-                 poisson_r=20.0, kernel_r=800.0, dart_k=30, spring=0.08,
+                 poisson_r=20.0, kernel_r=800.0, dart_k=30, spring=0.11,
+                 explore_p=0.04, explore_reach=8.0,
                  seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
                  fade_duration=0.6, fade_jitter=0.5):
@@ -91,6 +92,8 @@ class Renderer:
         self.kernel_r = float(kernel_r)       # kept-disc radius (reach); constant
         self.dart_k = int(dart_k)             # Bridson attempts per active point
         self.spring = spring
+        self.explore_p = explore_p            # chance a dart reaches far (scouting)
+        self.explore_reach = explore_reach    # scout reach, in units of poisson_r
         self.fade_duration = fade_duration
         self.fade_jitter = fade_jitter
 
@@ -273,9 +276,13 @@ class Renderer:
             if not self._alive[i]:
                 active[ai] = active[-1]; active.pop(); continue
             ox = self._X[i]; oy = self._Y[i]; placed = False
+            ep = self.explore_p; er = self.explore_reach
             for _ in range(k):
                 ang = rng.random() * _TWO_PI
-                rad = pr * (1.0 + rng.random())          # r .. 2r
+                if rng.random() < ep:                    # occasional scout further out
+                    rad = pr * (1.0 + rng.random() * er)
+                else:
+                    rad = pr * (1.0 + rng.random())      # normal r .. 2r
                 x = ox + math.cos(ang) * rad
                 y = oy + math.sin(ang) * rad
                 if (x - kc[0]) ** 2 + (y - kc[1]) ** 2 > kr2:
