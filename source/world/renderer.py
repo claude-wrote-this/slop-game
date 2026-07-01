@@ -82,7 +82,7 @@ class Renderer:
                  seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
                  fade_duration=1.4, fade_jitter=0.5, fade_sat=0.5,
-                 fade_near=0.35, haze=None):
+                 fade_near=0.35, sat_dist=1.0, haze=None):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.bg = bg
@@ -99,6 +99,7 @@ class Renderer:
         self.fade_jitter = fade_jitter
         self.fade_sat = fade_sat              # grow+fade in [0,fade_sat); saturate after
         self.fade_near = fade_near            # fade length near centre, as a fraction
+        self.sat_dist = sat_dist              # extra distance-weight on saturation only
         # haze colour a fading point starts at — match the cloud so terrain seems
         # to resolve out of it rather than sparkle in as white.
         if haze is None:
@@ -116,7 +117,8 @@ class Renderer:
         self._cap = cap
         self._X = np.zeros(cap); self._Y = np.zeros(cap)
         self._CK = np.zeros(cap, np.uint32); self._COMP = np.zeros(cap)
-        self._DUR = np.zeros(cap)     # per-point fade length (grows with distance)
+        self._DUR = np.zeros(cap)     # per-point total fade length (grows w/ distance)
+        self._GROW = np.zeros(cap)    # per-point grow-phase length (< _DUR)
         self._alive = np.zeros(cap, bool)
         self._free = list(range(cap - 1, -1, -1))
         self._grid = {}               # (cx, cy) -> [slot, ...], cell = poisson_r
@@ -130,7 +132,7 @@ class Renderer:
 
         # --- handoff: the published snapshot main draws from ---
         self._snap = (np.zeros((0, 2)), np.zeros(0, np.uint32),
-                      np.zeros(0), np.zeros(0))
+                      np.zeros(0), np.zeros(0), np.zeros(0))
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._work, name="poisson", daemon=True)
@@ -150,7 +152,7 @@ class Renderer:
         self._layer_zoom = 1.0
         self._prev_zoom = 1.0
         self._prev_now = time.monotonic()
-        self._P, self._K, self._C, self._D = self._snap
+        self._P, self._K, self._C, self._D, self._G = self._snap
 
         # --- cloud background ---
         self.cloud = cloud
@@ -196,17 +198,17 @@ class Renderer:
             b = np.zeros(new, dt); b[:old] = a; return b
         self._X = ext(self._X, float); self._Y = ext(self._Y, float)
         self._CK = ext(self._CK, np.uint32); self._COMP = ext(self._COMP, float)
-        self._DUR = ext(self._DUR, float)
+        self._DUR = ext(self._DUR, float); self._GROW = ext(self._GROW, float)
         al = np.zeros(new, bool); al[:old] = self._alive; self._alive = al
         self._free.extend(range(new - 1, old - 1, -1))
         self._cap = new
 
-    def _insert(self, x, y, ck, comp, dur):
+    def _insert(self, x, y, ck, comp, dur, grow):
         if not self._free:
             self._grow()
         i = self._free.pop()
         self._X[i] = x; self._Y[i] = y; self._CK[i] = ck
-        self._COMP[i] = comp; self._DUR[i] = dur
+        self._COMP[i] = comp; self._DUR[i] = dur; self._GROW[i] = grow
         self._alive[i] = True
         self._grid.setdefault(self._cell(x, y), []).append(i)
         self._active.append(i)
@@ -275,17 +277,23 @@ class Renderer:
         if mc > self._max_comp:
             self._max_comp = mc
 
-    def _fade_dur(self, dist2):
-        """Fade length for a point at squared-distance dist2 from the kernel
-        centre: near the centre it clears fast (fade_near fraction), the edge
-        takes the full duration, jitter also grows with distance (raggeder edge)."""
+    def _fade_times(self, dist2):
+        """(total, grow) fade lengths for a point at squared-distance dist2 from
+        the kernel centre. Both lengthen with distance (fade_near near the centre,
+        full at the edge). The saturation phase lengthens *extra* by sat_dist*w, so
+        distant points hold their haze markedly longer before resolving to terrain
+        colour than they take to grow in — saturation is doubly distance-weighted.
+        Jitter rides the saturation tail (a raggeder resolve edge)."""
         w = min(1.0, math.sqrt(dist2) / self.kernel_r)
-        base = self.fade_duration * (self.fade_near + (1.0 - self.fade_near) * w)
-        return base + self._rng.random() * self.fade_jitter * w
+        dw = self.fade_near + (1.0 - self.fade_near) * w
+        grow = self.fade_duration * self.fade_sat * dw
+        sat = self.fade_duration * (1.0 - self.fade_sat) * dw * (1.0 + self.sat_dist * w)
+        sat += self._rng.random() * self.fade_jitter * w
+        return grow + sat, grow
 
     def _seed(self, at):
-        dur = self._fade_dur(0.0)
-        s = self._insert(at[0], at[1], 0, time.monotonic() + dur, dur)
+        dur, grow = self._fade_times(0.0)
+        s = self._insert(at[0], at[1], 0, time.monotonic() + dur, dur, grow)
         self._assign_colours([s])
 
     def _dart(self, kc, budget):
@@ -315,8 +323,8 @@ class Renderer:
                 if d2 > kr2:
                     continue                              # outside the kept disc
                 if self._spacing_ok(x, y):
-                    dur = self._fade_dur(d2)
-                    new_slots.append(self._insert(x, y, 0, now + dur, dur))
+                    dur, grow = self._fade_times(d2)
+                    new_slots.append(self._insert(x, y, 0, now + dur, dur, grow))
                     placed = True
                     break
             if not placed:
@@ -329,7 +337,7 @@ class Renderer:
         idx = np.nonzero(self._alive)[0]
         pos = np.stack([self._X[idx], self._Y[idx]], axis=1)
         snap = (pos, self._CK[idx].copy(), self._COMP[idx].copy(),
-                self._DUR[idx].copy())
+                self._DUR[idx].copy(), self._GROW[idx].copy())
         with self._lock:
             self._snap = snap
 
@@ -346,7 +354,11 @@ class Renderer:
             mx = self._kc[0] - self._rearm_kc[0]
             my = self._kc[1] - self._rearm_kc[1]
             work = False
-            if mx * mx + my * my > self.poisson_r * self.poisson_r:
+            # Re-arm at half-spacing granularity: smaller, more frequent frontier
+            # refreshes spread the eviction/dart work across more ticks, so the
+            # generation reads as continuous rather than stepping each full poisson_r.
+            step = 0.5 * self.poisson_r
+            if mx * mx + my * my > step * step:
                 self._evict(self._kc)
                 self._rearm(self._kc, (mx, my))
                 self._rearm_kc = self._kc
@@ -373,7 +385,7 @@ class Renderer:
         P = self._P
         if P.shape[0] == 0:
             e = np.zeros(0)
-            return e, e, self._K[:0], self._C[:0], self._D[:0]
+            return e, e, self._K[:0], self._C[:0], self._D[:0], self._G[:0]
         cx = cam[0] + self.w * 0.5
         cy = cam[1] + self.h * 0.5
         r = self._scaled_r
@@ -385,7 +397,7 @@ class Renderer:
         px = P[m]
         sx = self.w * 0.5 + (px[:, 0] - cx) * zoom
         sy = self.h * 0.5 + (px[:, 1] - cy) * zoom
-        return sx, sy, self._K[m], self._C[m], self._D[m]
+        return sx, sy, self._K[m], self._C[m], self._D[m], self._G[m]
 
     # --- draw kernels -----------------------------------------------------
     def _ensure_kernels(self, zoom):
@@ -421,9 +433,16 @@ class Renderer:
         s.set_colorkey(_CKEY, pygame.RLEACCEL)
         return s
 
-    def _blit_fading(self, target, sx, sy, keys, comp, dur, now):
-        prog = np.clip(1.0 - (comp - now) / dur, 0.0, 1.0)   # per-point fade length
-        lv = (prog * self._FADE_LEVELS).astype(np.int32)
+    def _blit_fading(self, target, sx, sy, keys, comp, dur, grow, now):
+        # Split each point's own timeline into its grow phase then its (separately
+        # distance-weighted) saturation phase and fold them into one 0..2 progress:
+        # grow spans [0,1], saturation spans [1,2]. The kernel cache keys off the
+        # quantised combined level so the two phases still share one lookup.
+        elapsed = dur - (comp - now)
+        grow = np.maximum(grow, 1e-6)
+        gp = np.clip(elapsed / grow, 0.0, 1.0)                       # grow 0..1
+        sp = np.clip((elapsed - grow) / np.maximum(dur - grow, 1e-6), 0.0, 1.0)
+        lv = ((gp + sp) * self._FADE_LEVELS).astype(np.int32)        # 0 .. 2*LEVELS
         # Draw oldest (most-resolved) first, newest (whitest) last, so the young
         # white points stay on top rather than resolved ones poking through them.
         order = np.argsort(lv)[::-1]
@@ -443,13 +462,13 @@ class Renderer:
             target.blit(ker, (int(xs[i]) - kr, int(ys[i]) - kr))
 
     def _make_fade_kernel(self, ck, level):
-        # Staggered fade in two phases of the progress `frac`:
-        #   [0, fade_sat): a white puff grows (r2) and fades in (alpha)
-        #   [fade_sat, 1]: at full size/opacity it desaturates white -> terrain,
-        # so the edge reads as cloud arriving first, then resolving into ground.
-        frac = level / self._FADE_LEVELS
-        grow = min(1.0, frac / self.fade_sat)                    # size + alpha
-        sat = max(0.0, (frac - self.fade_sat) / (1.0 - self.fade_sat))  # colour
+        # `level` runs 0..2*FADE_LEVELS: the grow phase then the saturation phase,
+        # each already sized per-point by _blit_fading. So frac2 in [0,1] grows the
+        # white puff (r2 + alpha) and frac2 in [1,2] desaturates haze -> terrain,
+        # reading as cloud arriving first, then resolving into ground.
+        frac2 = level / self._FADE_LEVELS
+        grow = min(1.0, frac2)                                   # size + alpha
+        sat = max(0.0, frac2 - 1.0)                              # colour
         r2 = max(1, int(round(self._scaled_r * grow)))
         ker = _make_kernel(r2)
         r = ck >> 16; g = (ck >> 8) & 0xFF; b = ck & 0xFF
@@ -473,7 +492,7 @@ class Renderer:
 
     def _rebuild_layer(self, now, cam, zoom):
         self._layer.fill(_CKEY)
-        sx, sy, keys, comp, _ = self._cull(cam, zoom, 0, 0, self.w, self.h)
+        sx, sy, keys, comp, _, _ = self._cull(cam, zoom, 0, 0, self.w, self.h)
         settled = now >= comp
         if settled.any():
             self._blit_settled(self._layer, sx[settled], sy[settled],
@@ -498,7 +517,7 @@ class Renderer:
 
         def strip(x0, x1, y0, y1):
             L.fill(_CKEY, (x0, y0, x1 - x0, y1 - y0))
-            sx, sy, keys, comp, _ = self._cull(lcam, zoom, x0, y0, x1, y1)
+            sx, sy, keys, comp, _, _ = self._cull(lcam, zoom, x0, y0, x1, y1)
             settled = now >= comp
             if settled.any():
                 self._blit_settled(L, sx[settled], sy[settled], keys[settled], r)
@@ -511,7 +530,7 @@ class Renderer:
     def _commit_settles(self, now, cam, zoom):
         if self._prev_now >= self._max_comp:
             return
-        sx, sy, keys, comp, _ = self._cull(cam, zoom, 0, 0, self.w, self.h)
+        sx, sy, keys, comp, _, _ = self._cull(cam, zoom, 0, 0, self.w, self.h)
         just = (comp > self._prev_now) & (comp <= now)
         if just.any():
             self._blit_settled(self._layer, sx[just], sy[just], keys[just], self._scaled_r)
@@ -574,7 +593,7 @@ class Renderer:
             target.fill(self.bg)
 
         with self._lock:                  # grab the latest published snapshot
-            self._P, self._K, self._C, self._D = self._snap
+            self._P, self._K, self._C, self._D, self._G = self._snap
         now = time.monotonic()
         self._ensure_kernels(zoom)
 
@@ -593,11 +612,11 @@ class Renderer:
             self._reproject(target, cam, zoom)
 
         if now < self._max_comp:          # any point still mid-fade?
-            sx, sy, keys, comp, dur = self._cull(cam, zoom, 0, 0, self.w, self.h)
+            sx, sy, keys, comp, dur, grow = self._cull(cam, zoom, 0, 0, self.w, self.h)
             fading = now < comp
             if fading.any():
                 self._blit_fading(target, sx[fading], sy[fading], keys[fading],
-                                  comp[fading], dur[fading], now)
+                                  comp[fading], dur[fading], grow[fading], now)
 
         self._prev_zoom = zoom
         self._prev_now = now
