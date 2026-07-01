@@ -665,8 +665,8 @@ class Renderer:
         else:
             kx, ky = W * 0.5, H * 0.5
         pf = self._cloud_pf
-        pvx = (kx - cam_x * pf) * bw / W       # kernel pivot + world-parallax
-        pvy = (ky - cam_y * pf) * bh / H
+        pvx = (kx + cam_x * pf) * bw / W       # +cam: pan opposite to the content
+        pvy = (ky + cam_y * pf) * bh / H
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
