@@ -184,8 +184,9 @@ class Renderer:
             self._front_accum = 0.0          # travelled screen px since last spawn
             self._front_pvc = None           # calibrated on the first draw
             self._front_alpha = 205
-            self._front_spacing = max(24.0, self.radius * 2.4)  # px between spawns
-            self._front_size = self.radius * 2.4                # base screen radius
+            self._front_spacing = max(18.0, self.radius * 1.6)  # px between spawns
+            self._front_size = self.radius * 2.0                # base screen radius
+            self._front_arc = 1.15               # half angular spread along the edge
             self._front_cap = 90
 
     # --- view API (main thread) -------------------------------------------
@@ -620,27 +621,33 @@ class Renderer:
         rng = self._front_rng
         puffs = self._front
 
-        # Spawn along the leading screen edge, one per _front_spacing px travelled.
-        if mag > 1e-6 and len(puffs) < self._front_cap:
-            dx = dvx / mag; dy = dvy / mag        # motion dir = leading edge dir
-            perpx, perpy = -dy, dx
-            half_span = 0.5 * (abs(perpx) * w + abs(perpy) * h)   # edge extent
-            tb = min((w * 0.5) / abs(dx) if abs(dx) > 1e-9 else 1e18,
-                     (h * 0.5) / abs(dy) if abs(dy) > 1e-9 else 1e18)
-            ex = w * 0.5 + dx * tb; ey = h * 0.5 + dy * tb        # edge midpoint
-            self._front_accum += mag * zoom
-            while (self._front_accum >= self._front_spacing
-                   and len(puffs) < self._front_cap):
-                self._front_accum -= self._front_spacing
-                off = (rng.random() * 2.0 - 1.0) * half_span * 0.85
-                depth = rng.random() * 0.05 * max(w, h)          # just past the edge
-                sx = ex + perpx * off + dx * depth
-                sy = ey + perpy * off + dy * depth
-                wx = cam[0] + w * 0.5 + (sx - w * 0.5) / zoom     # anchor in world
-                wy = cam[1] + h * 0.5 + (sy - h * 0.5) / zoom
-                life = 0.7 + rng.random() * 0.9
-                r_px = self._front_size * (0.6 + rng.random() * 0.8)
-                puffs.append((wx, wy, now, life, r_px))
+        # Spawn on the kernel disc's actual leading edge (kc + dir*kernel_r). When
+        # the view outruns the sampler kc lags behind the view centre, so that edge
+        # crosses onto the screen — the boundary of generated terrain — and the
+        # puffs there veil the pop-in. When generation keeps up kc ~ view centre,
+        # the edge sits off-screen and nothing spawns. One per px travelled.
+        kc = self._kc
+        if kc is not None and mag > 1e-6 and len(puffs) < self._front_cap:
+            ddx = vc[0] - kc[0]; ddy = vc[1] - kc[1]     # kc lags the view by this
+            lag = math.hypot(ddx, ddy)
+            if lag > 1e-6:
+                lead = math.atan2(ddy, ddx)              # toward the leading edge
+                kr = self.kernel_r
+                self._front_accum += mag * zoom
+                while (self._front_accum >= self._front_spacing
+                       and len(puffs) < self._front_cap):
+                    self._front_accum -= self._front_spacing
+                    a = lead + (rng.random() * 2.0 - 1.0) * self._front_arc
+                    wx = kc[0] + math.cos(a) * kr        # a point on the disc edge
+                    wy = kc[1] + math.sin(a) * kr
+                    sx = w * 0.5 + (wx - vc[0]) * zoom    # project to screen
+                    sy = h * 0.5 + (wy - vc[1]) * zoom
+                    if sx < -40 or sx > w + 40 or sy < -40 or sy > h + 40:
+                        continue                          # off-screen slice of arc
+                    life = 0.7 + rng.random() * 0.9
+                    u = rng.random()                      # u^2 skews toward small
+                    r_px = self._front_size * (0.18 + u * u * 1.5)
+                    puffs.append((wx, wy, now, life, r_px))
         else:
             self._front_accum = 0.0
 
