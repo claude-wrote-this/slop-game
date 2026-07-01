@@ -34,6 +34,11 @@ class GameScene(Scene):
         self.renderer = world["renderer"]
         self.cam_x, self.cam_y = world["cam"]   # world-space top-left at zoom 1
         self.zoom = 1.0
+        # Clamp zoom-out so the screen diagonal stays within ~2/3 of the kernel
+        # disc's diameter — the view never pans/zooms past generated terrain.
+        diag = math.hypot(config.SCREEN_W, config.SCREEN_H)
+        self.zoom_min = 3.0 * diag / (4.0 * self.renderer.kernel_r)
+        self.zoom_max = 8.0
         self._drag = None                       # mouse/single-finger pan anchor
         self._fingers = {}                      # finger_id -> (px, py) in pixels
         self._pinch_dist = None                 # last two-finger separation
@@ -46,7 +51,7 @@ class GameScene(Scene):
         ]
 
     def on_exit(self):
-        self.renderer.shutdown()           # stop the buffer thread first
+        self.renderer.shutdown()           # stop the generation worker first
         saves.save_game(self.slug, self.state)
 
     def _save(self):
@@ -76,11 +81,12 @@ class GameScene(Scene):
         self.cam_x = wx - config.SCREEN_W / 2 - (sx - config.SCREEN_W / 2) / self.zoom
         self.cam_y = wy - config.SCREEN_H / 2 - (sy - config.SCREEN_H / 2) / self.zoom
 
+    def _clampz(self, z):
+        return max(self.zoom_min, min(self.zoom_max, z))
+
     def _zoom_at(self, factor, fx, fy):
         """Scale zoom by `factor` keeping the world point under (fx, fy) fixed."""
-        new = self.zoom * factor               # unclamped
-        # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0       # clamp — needed eventually
-        # new = max(ZOOM_MIN, min(ZOOM_MAX, new))
+        new = self._clampz(self.zoom * factor)
         if new == self.zoom:
             return
         wx, wy = self._world_under(fx, fy)
@@ -99,9 +105,7 @@ class GameScene(Scene):
         though fingers report one at a time."""
         if self._pinch_dist and self._pinch_mid is not None and dist > 0:
             wx, wy = self._world_under(*self._pinch_mid)     # world under old mid
-            self.zoom *= dist / self._pinch_dist
-            # ZOOM_MIN, ZOOM_MAX = 0.05, 8.0   # clamp — needed eventually
-            # self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom))
+            self.zoom = self._clampz(self.zoom * dist / self._pinch_dist)
             self._pin(wx, wy, mid[0], mid[1])                # ...to the new mid
         self._pinch_dist, self._pinch_mid = dist, mid
 

@@ -7,8 +7,8 @@ from source import config
 from source.world.heightmap import TerrainHeight
 from source.world.renderer import Renderer
 
-DENSITY = getattr(config, "RENDER_DENSITY", 0.008)   # target points per world px^2
-AREA = getattr(config, "RENDER_AREA", None)          # None -> a few screens wide
+POISSON_R = getattr(config, "RENDER_POISSON_R", 20.0)   # min spacing (density)
+KERNEL_R = getattr(config, "RENDER_KERNEL_R", 800.0)    # kept-disc radius (reach)
 
 
 def build_world(seed):
@@ -16,7 +16,8 @@ def build_world(seed):
 
     terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS)
     renderer = Renderer(config.SCREEN_W, config.SCREEN_H, terrain=terrain,
-                        tile=config.TERRAIN_TILE, seed=seed, density=DENSITY, area=AREA)
+                        tile=config.TERRAIN_TILE, seed=seed,
+                        poisson_r=POISSON_R, kernel_r=KERNEL_R)
 
     cam_x = -(config.SCREEN_W // 2)                  # world origin centered on screen
     cam_y = -(config.SCREEN_H // 2)
