@@ -159,8 +159,8 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
-            self._cloud_c = None         # smoothed resolved-points centre (world)
-            self._cloud_ck = 0.08        # per-frame follow rate for that centre
+            self._cloud_c_prev = None    # last frame's raw resolved centroid (world)
+            self._cloud_comp = (0.0, 0.0)  # accumulated -(centroid churn) offset
             self._cloud_big, self._cloud_B = self._build_cloud_big()
             self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
@@ -652,33 +652,30 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds are centred on the resolved-terrain centre and scroll radially
-        # outward from it. That centre is the centroid of the resolved points, not the
-        # kernel: the kernel roams *around* the disc of points, so its position lags
-        # and orbits, whereas the mean of the points sits at the middle of the
-        # resolved region. But the raw mean lurches: the sampler evicts trailing
-        # points beyond kernel_r in discrete batches (off-screen), so the centroid
-        # jumps each time the disc "catches up" to the kernel. Exactly cancelling that
-        # cull shift would drift unboundedly — culling and refilling are two halves of
-        # the same tracking motion, so cancelling only the cull half leaves the centre
-        # falling ever further behind. Instead follow the raw centroid with a critically
-        # damped step (_cloud_ck): the batch lurch is smoothed to a gentle slide, the
-        # lag stays bounded, and it settles onto the true centroid whenever panning
-        # stops. The result projects to (kpx, kpy) and is pinned as a tile lattice
-        # point, the fixed point of the breathing zoom, so tiles grow (sc 1->2) outward
-        # from the resolved centre while the seamless tile hides the loop and the slide.
+        # The clouds are centred on the resolved-points centroid and scroll radially
+        # outward from it. But the raw centroid churns: the sampler adds frontier
+        # points and evicts trailing ones each re-arm, and every such change shifts the
+        # centroid by some (dx, dy), dragging the whole texture with it. So each frame
+        # we measure that shift (the centroid delta since last frame) and accumulate
+        # its opposite into _cloud_comp, then add _cloud_comp back onto the centroid:
+        # a +dx shift from evicting and a +dx shift from adding are both cancelled by
+        # -dx, so point churn no longer moves the texture. What remains after the
+        # cancellation projects to (kpx, kpy) and is pinned as a tile lattice point —
+        # the fixed point of the breathing zoom — so tiles grow (sc 1->2) outward from
+        # that centre while the seamless tile hides the loop.
         z = self.zoom
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
         P = self._P
-        target_c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
-        if self._cloud_c is None:
-            self._cloud_c = target_c
-        else:
-            cx0, cy0 = self._cloud_c
-            self._cloud_c = (cx0 + (target_c[0] - cx0) * self._cloud_ck,
-                             cy0 + (target_c[1] - cy0) * self._cloud_ck)
-        rcx, rcy = self._cloud_c
+        c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
+        if self._cloud_c_prev is None:
+            self._cloud_c_prev = c
+        # cancel this frame's centroid churn (both eviction and addition shifts)
+        self._cloud_comp = (self._cloud_comp[0] - (c[0] - self._cloud_c_prev[0]),
+                            self._cloud_comp[1] - (c[1] - self._cloud_c_prev[1]))
+        self._cloud_c_prev = c
+        rcx = c[0] + self._cloud_comp[0]
+        rcy = c[1] + self._cloud_comp[1]
         kpx = bw * 0.5 + (rcx - vx) * z * bw / W    # resolved centre projected to buffer
         kpy = bh * 0.5 + (rcy - vy) * z * bh / H
         base = self._cloud_zt; B = self._cloud_zB
