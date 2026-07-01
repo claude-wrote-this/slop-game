@@ -161,8 +161,10 @@ class Renderer:
             self.cloud_t = 0.0
             self._cloud_c_prev = None    # last frame's raw resolved centroid (world)
             self._cloud_comp = (0.0, 0.0)  # accumulated -(centroid churn) offset
+            self._cloud_piv = None       # spring-smoothed real centroid (zoom pivot)
+            self._cloud_pivk = 0.15      # pivot spring rate per frame (de-jitter)
             self._cloud_big, self._cloud_B = self._build_cloud_big()
-            self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
+            self._cloud_zrate = 0.0035   # radial-zoom phase per frame (outward flow)
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
                                int(255 - cloud_depth * 0.7))   # clear-sky fill
             # The radial zoom is scale-heavy, so render it to a half-res buffer (the
@@ -682,8 +684,17 @@ class Renderer:
         self._cloud_c_prev = c
         rcx = c[0] + self._cloud_comp[0]         # churn-cancelled centre (translation)
         rcy = c[1] + self._cloud_comp[1]
-        pvx = bw * 0.5 + (c[0] - vx) * sxw       # real centroid -> zoom pivot
-        pvy = bh * 0.5 + (c[1] - vy) * syw
+        # the pivot follows the real centroid, but that centroid jitters on every
+        # add/evict batch; spring it so the zoom point glides instead of twitching.
+        if self._cloud_piv is None:
+            self._cloud_piv = c
+        else:
+            px0, py0 = self._cloud_piv
+            self._cloud_piv = (px0 + (c[0] - px0) * self._cloud_pivk,
+                               py0 + (c[1] - py0) * self._cloud_pivk)
+        pcx, pcy = self._cloud_piv
+        pvx = bw * 0.5 + (pcx - vx) * sxw        # smoothed real centroid -> zoom pivot
+        pvy = bh * 0.5 + (pcy - vy) * syw
         a0x = bw * 0.5 + (rcx - vx) * sxw        # churn-free centre -> translation anchor
         a0y = bh * 0.5 + (rcy - vy) * syw
         base = self._cloud_zt; B = self._cloud_zB
