@@ -172,7 +172,9 @@ class Renderer:
             self._cloud_buf = pygame.Surface((max(1, int(screen_w * zf)),
                                               max(1, int(screen_h * zf))))
             self._cloud_zB = max(1, int(round(self._cloud_B * zf)))
-            self._cloud_zt = pygame.transform.scale(
+            # smoothscale (bilinear) so the aliased draw.circle edges soften as the
+            # tile is downsized, rather than carrying their jaggies into the buffer.
+            self._cloud_zt = pygame.transform.smoothscale(
                 self._cloud_big, (self._cloud_zB, self._cloud_zB))
             # one shared cloud palette (blue-white by cloud shade, billow 0..1) that
             # the background, the puffs and the new-point haze all draw from, so they
@@ -704,7 +706,7 @@ class Renderer:
             if alpha < 4:
                 continue
             T = max(1, int(round(B * sc)))
-            scaled = pygame.transform.scale(base, (T, T))
+            scaled = pygame.transform.smoothscale(base, (T, T))
             scaled.set_alpha(alpha)
             sx0 = ox - T * math.ceil(ox / T)     # tile from the lattice point at o
             sy0 = oy - T * math.ceil(oy / T)
@@ -715,7 +717,11 @@ class Renderer:
                     buf.blit(scaled, (int(x), int(y)))
                     x += T
                 y += T
-        pygame.transform.scale(buf, (self.w, self.h), target)   # upscale once
+        # smoothscale the final upscale: the ~2.5x blow-up of the low-res buffer is
+        # where the circle edges read as blocky, and bilinear turns them into soft
+        # gradients. This is the dominant AA win; the tile-scale smoothing above just
+        # keeps the per-tile magnification from re-introducing hard edges.
+        pygame.transform.smoothscale(buf, (self.w, self.h), target)   # upscale once
 
     # --- ephemeral cloud front --------------------------------------------
     def _spawn_front(self, cam, zoom, now, dt):
