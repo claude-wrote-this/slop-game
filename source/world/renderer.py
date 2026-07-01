@@ -413,8 +413,14 @@ class Renderer:
         frac = level / self._FADE_LEVELS
         r2 = max(1, int(round(self._scaled_r * frac)))
         ker = _make_kernel(r2)
-        ker.fill((ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF, int(255 * frac)),
-                 special_flags=pygame.BLEND_RGBA_MULT)
+        # A fading point grows (r2), fades in (alpha) AND desaturates from white to
+        # its terrain colour, so the advancing edge reads as hazy cloud resolving
+        # into ground. colour = lerp(white, terrain, frac).
+        r = ck >> 16; g = (ck >> 8) & 0xFF; b = ck & 0xFF
+        wr = int(255 - frac * (255 - r))
+        wg = int(255 - frac * (255 - g))
+        wb = int(255 - frac * (255 - b))
+        ker.fill((wr, wg, wb, int(255 * frac)), special_flags=pygame.BLEND_RGBA_MULT)
         return ker, r2
 
     # --- terrain layer ----------------------------------------------------
