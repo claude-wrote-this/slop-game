@@ -13,7 +13,7 @@ def _target_points(kernel_r, poisson_r):
     return max(1, int(0.6 * math.pi * (kernel_r / poisson_r) ** 2))
 
 _REF_DIAG = math.hypot(450, 820)                         # design reference screen
-BASE_POISSON = getattr(config, "RENDER_POISSON_R", 20.0)  # min spacing at reference
+BASE_POISSON = getattr(config, "RENDER_POISSON_R", 13.0)  # min spacing at reference
 # kernel_r as a fraction of the screen diagonal. zoom_min = 3/(4*factor), so 0.9
 # gives a most-zoomed-out of ~0.83 — the default zoom (1.0) is always valid, at
 # any resolution, which fixes the view starting more zoomed-out than allowed.
