@@ -670,13 +670,19 @@ class Renderer:
         wgt = (dist / self.kernel_r) ** 2 + 0.02    # err outward, away from centre
         wgt /= wgt.sum()
         pick = rng.choice(ci.size, size=n, p=wgt)
-        jit = self.poisson_r * 0.6
+        pr = self.poisson_r
         for j in pick.tolist():
             i = ci[j]
             ux = dcx[j] / dist[j]; uy = dcy[j] / dist[j]        # outward unit vector
-            off = self.poisson_r * (0.4 + rng.random() * 1.2)   # push past the point
-            wx = P[i, 0] + ux * off + (rng.random() * 2.0 - 1.0) * jit
-            wy = P[i, 1] + uy * off + (rng.random() * 2.0 - 1.0) * jit
+            tx = -uy; ty = ux                                   # along the edge
+            off = pr * (0.4 + rng.random() * 1.2)               # push past the point
+            # Spread wide *along* the edge so each sample's puffs bridge to its
+            # neighbours, covering the gaps between samples that briefly expose the
+            # saturated front; keep the radial jitter tight so the cover stays a band.
+            tan = (rng.random() * 2.0 - 1.0) * pr * 1.7
+            rad = (rng.random() * 2.0 - 1.0) * pr * 0.35
+            wx = P[i, 0] + ux * (off + rad) + tx * tan
+            wy = P[i, 1] + uy * (off + rad) + ty * tan
             life = 0.5 + rng.random() * 0.8
             puffs.append((wx, wy, now, life, self.radius))   # standard point size
 
