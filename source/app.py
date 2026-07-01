@@ -110,4 +110,6 @@ class App:
             frames += 1
             if max_frames and frames >= max_frames:
                 break
+        while self._stack:                 # fire on_exit (stops the buffer thread) before quit
+            self.pop()
         pygame.quit()	

@@ -1,38 +1,57 @@
-"""Screen-space streaming terrain renderer over a drifting cloud background.
+"""Roaming Poisson-disk terrain renderer over a drifting cloud background.
 
-Model: a drifting billow cloud fills the background; terrain streams in ON TOP,
-fading in (alpha) to cover the cloud where it spawns. Unexplored area shows the
-moving clouds; as terrain points accumulate they fade from cloud to solid ground.
+Generation (worker thread): continuous, Bridson-style Poisson-disk sampling that
+roams. An active list darts at poisson_r..2*poisson_r around active points; a
+sparse spatial-hash grid (dict of int cells, populated only where points exist)
+enforces the minimum spacing. Two radii, kept separate:
 
-A full-speed worker thread drains the exposed area (no per-frame budget): it
-scatters random points, samples each (numpy -> GIL released, so genuinely
-parallel) and splats a soft, semi-transparent kernel into an alpha buffer.
-Selection is biased AWAY from the nearest screen edge, so the fill creeps inward
-off the frame (soft trailing edge) rather than repopulating evenly. Main draws
-the cloud background, then blits the alpha buffer over it.
+  * poisson_r — minimum spacing between points (local density / fill pattern).
+  * kernel_r  — radius of the kept disc around the elastic kernel center (reach).
+                A constant (bounds load); the scene clamps zoom so the screen
+                stays within the disc.
 
-Object protocol: covers_screen: bool; sample_points(X, Y) -> (height, colour).
+The kernel center springs toward the view's world center. Points beyond kernel_r
+are evicted (squared-distance in/out test, kept in sync with the grid). When
+spacing is satisfied across the disc the active list drains and the worker idles;
+kernel motion re-arms only the frontier (the disc's leading-edge ring), so work is
+O(kernel motion), never O(whole disc). Each accepted point is stamped with its
+fade completion and its colour sampled from the terrain function.
 
-Threading: the worker owns/mutates the buffer (scroll/blank/splat); main only
-reads it. A lock guards a worker SCROLL against a main read; splats run lock-free
-(a pixel caught mid-write is at worst one frame stale).
+Handoff: the worker owns the point store + grid + active list and publishes an
+immutable (pos, colour, completion) snapshot under a short lock; the main thread
+never sees a torn store and the worker never stalls on it.
+
+Screen (main thread): the settled points are cached on a screen-size colorkey
+terrain layer, reprojected each frame (scroll for pan, scale for zoom, rebuilt on
+drift). Fading points (completion in the future) are drawn fresh on top. Zoom is a
+draw-time scale only; the cloud background is a precomputed tiled scroll-blit.
+TerrainHeight (z/colour) is unchanged.
 """
+import math
+import sys
 import threading
 import time
 
 import numpy as np
 import pygame
 
-BATCH = 400
+# The generation worker is Python-heavy; shorten the GIL switch interval so the
+# main draw thread gets the lock promptly each frame instead of waiting out a full
+# ~5ms slice while the worker darts. Lets the worker run at full throughput.
+sys.setswitchinterval(0.0008)
 
 
-def _make_kernel(radius, peak):
-    # soft, semi-transparent disc; accumulating these alpha-composites terrain
-    # up from transparent (cloud showing) to opaque -> points fade in.
+_CKEY = (255, 0, 255)   # colorkey for opaque kernels; never in the green palette
+_TWO_PI = 2.0 * math.pi
+
+
+def _make_kernel(radius):
+    # SRCALPHA solid circle, ~1px antialiased edge. Used for FADING points, which
+    # need real per-pixel alpha; settled points use the faster opaque colorkey one.
     d = radius * 2 + 1
     yy, xx = np.mgrid[0:d, 0:d]
-    dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2) / max(1, radius)
-    alpha = (np.clip(1 - dist, 0, 1) ** 1.5 * peak).astype(np.uint8)
+    dist = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2)
+    alpha = (np.clip(radius + 0.5 - dist, 0.0, 1.0) * 255).astype(np.uint8)
     surf = pygame.Surface((d, d), pygame.SRCALPHA)
     surf.fill((255, 255, 255, 0))
     a = pygame.surfarray.pixels_alpha(surf)
@@ -57,35 +76,66 @@ def _make_cloud_tex(size, seed):
 
 
 class Renderer:
-    def __init__(self, screen_w, screen_h, *, tile=16, objects=(),
-                 density=0.03, oversize=3, bg=(15, 17, 21),
-                 cloud=True, cloud_scale=0.55, cloud_drift=(0.35, 0.14),
-                 cloud_seed=0, cloud_depth=85, fill_bias=3, fade=200, cell=32):
+    def __init__(self, screen_w, screen_h, *, terrain, tile=16,
+                 poisson_r=20.0, kernel_r=800.0, dart_k=30, spring=0.08,
+                 seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
+                 cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
+                 fade_duration=0.6, fade_jitter=0.5):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
-        self.objects = list(objects)
-        self.density = density
-        self.fill_bias = fill_bias
-        self.cell = cell
         self.bg = bg
-        self.radius = max(1, int(tile * 0.95))
-        self.kernel = _make_kernel(self.radius, fade)
-        self._kc = {}
-        self.M = oversize * tile
-        self.bw = self.w + 2 * self.M
-        self.bh = self.h + 2 * self.M
-        self.buffer = pygame.Surface((self.bw, self.bh), pygame.SRCALPHA)
-        self.buffer.fill((0, 0, 0, 0))                 # transparent -> cloud shows through
-        self.buf_ox = 0
-        self.buf_oy = 0
-        self._rng = np.random.default_rng()
-        self.cam_x = 0
-        self.cam_y = 0
-        self._init = False
-        self._prefetch = max(self.radius + tile, self.M - self.radius)
-        self.dirty = []
+        self.terrain = terrain
+
+        # --- generation tunables ---
+        self.poisson_r = float(poisson_r)     # minimum spacing (density)
+        self.kernel_r = float(kernel_r)       # kept-disc radius (reach); constant
+        self.dart_k = int(dart_k)             # Bridson attempts per active point
+        self.spring = spring
+        self.fade_duration = fade_duration
+        self.fade_jitter = fade_jitter
+
+        # --- view (main thread writes, worker reads) ---
+        self._cam = (0.0, 0.0)        # world top-left of the view
+        self.zoom = 1.0
+
+        # --- worker-owned point store (slots) + sparse grid + active list -----
+        cap = 1024
+        self._cap = cap
+        self._X = np.zeros(cap); self._Y = np.zeros(cap)
+        self._CK = np.zeros(cap, np.uint32); self._COMP = np.zeros(cap)
+        self._alive = np.zeros(cap, bool)
+        self._free = list(range(cap - 1, -1, -1))
+        self._grid = {}               # (cx, cy) -> [slot, ...], cell = poisson_r
+        self._active = []             # slots that may still have room around them
+        self._kc = None               # kernel center (world), springs to view
+        self._rearm_kc = (0.0, 0.0)   # kernel center at the last frontier re-arm
+        self._max_comp = 0.0          # latest completion stamped (gates fade path)
+        self._rng = np.random.default_rng(seed)
+
+        # --- handoff: the published snapshot main draws from ---
+        self._snap = (np.zeros((0, 2)), np.zeros(0, np.uint32), np.zeros(0))
         self._lock = threading.Lock()
-        self._edge_norm = 0.5 * min(self.w, self.h)
+        self._running = True
+        self._thread = threading.Thread(target=self._work, name="poisson", daemon=True)
+        self._thread.start()
+
+        # --- draw kernels (main thread only) ---
+        self.radius = max(1, int(tile * 0.95))
+        self._zoom_bucket = None
+        self._scaled_r = self.radius
+        self._solid = {}
+        self._fade = {}
+        self._FADE_LEVELS = 6
+
+        # --- terrain layer (screen-size colorkey cache; main thread only) ---
+        self._layer = None
+        self._layer_cam = (0.0, 0.0)
+        self._layer_zoom = 1.0
+        self._prev_zoom = 1.0
+        self._prev_now = time.monotonic()
+        self._P = self._snap[0]; self._K = self._snap[1]; self._C = self._snap[2]
+
+        # --- cloud background ---
         self.cloud = cloud
         if cloud:
             self.cloud_tex = _make_cloud_tex(512, cloud_seed)
@@ -93,208 +143,413 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
-            self._cloud_surf = pygame.Surface((self.w, self.h))
-        self._running = True
-        self._worker = threading.Thread(target=self._work, name="splat", daemon=True)
-        self._worker.start()
+            self._cloud_big, self._cloud_B = self._build_cloud_big()
 
+    # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
-        self.cam_x, self.cam_y = int(x), int(y)
+        self._cam = (float(x), float(y))
+
+    def set_zoom(self, z):
+        self.zoom = float(z)
+
+    def _view_center(self):
+        cx, cy = self._cam
+        return (cx + self.w * 0.5, cy + self.h * 0.5)
 
     def pending_points(self):
+        return 0                          # generation streams in-game via the fade
+
+    def render(self):
+        pass
+
+    def shutdown(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    # --- worker: roaming Bridson Poisson-disk sampling --------------------
+    def _cell(self, x, y):
+        pr = self.poisson_r
+        return (int(math.floor(x / pr)), int(math.floor(y / pr)))
+
+    def _grow(self):
+        old = self._cap; new = old * 2
+        def ext(a, dt):
+            b = np.zeros(new, dt); b[:old] = a; return b
+        self._X = ext(self._X, float); self._Y = ext(self._Y, float)
+        self._CK = ext(self._CK, np.uint32); self._COMP = ext(self._COMP, float)
+        al = np.zeros(new, bool); al[:old] = self._alive; self._alive = al
+        self._free.extend(range(new - 1, old - 1, -1))
+        self._cap = new
+
+    def _insert(self, x, y, ck, comp):
+        if not self._free:
+            self._grow()
+        i = self._free.pop()
+        self._X[i] = x; self._Y[i] = y; self._CK[i] = ck; self._COMP[i] = comp
+        self._alive[i] = True
+        self._grid.setdefault(self._cell(x, y), []).append(i)
+        self._active.append(i)
+        return i
+
+    def _remove(self, i):
+        self._alive[i] = False
+        c = self._cell(self._X[i], self._Y[i])
+        lst = self._grid.get(c)
+        if lst is not None:
+            try:
+                lst.remove(i)
+            except ValueError:
+                pass
+            if not lst:
+                del self._grid[c]
+        self._free.append(i)
+
+    def _spacing_ok(self, x, y):
+        pr2 = self.poisson_r * self.poisson_r
+        cx, cy = self._cell(x, y)
+        g = self._grid; X = self._X; Y = self._Y; al = self._alive
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                lst = g.get((gx, gy))
+                if lst:
+                    for j in lst:
+                        if al[j] and (X[j] - x) ** 2 + (Y[j] - y) ** 2 < pr2:
+                            return False
+        return True
+
+    def _evict(self, kc):
+        kr2 = self.kernel_r * self.kernel_r
+        idx = np.nonzero(self._alive)[0]
+        if idx.size == 0:
+            return
+        dx = self._X[idx] - kc[0]; dy = self._Y[idx] - kc[1]
+        far = idx[(dx * dx + dy * dy) > kr2]
+        for i in far.tolist():
+            self._remove(int(i))
+
+    def _rearm(self, kc, motion):
+        """Re-activate the leading-edge ring so darts refill the newly-exposed
+        crescent (emergent — no lune math). Never touches the settled interior."""
+        kr = self.kernel_r; pr = self.poisson_r
+        inner = (kr - 2 * pr) ** 2; outer = kr * kr
+        idx = np.nonzero(self._alive)[0]
+        if idx.size == 0:
+            return
+        dx = self._X[idx] - kc[0]; dy = self._Y[idx] - kc[1]
+        d2 = dx * dx + dy * dy
+        ring = (d2 >= inner) & (d2 <= outer)
+        mx, my = motion
+        if mx * mx + my * my > 1e-9:              # only the leading half
+            ring &= (dx * mx + dy * my) > 0.0
+        self._active.extend(idx[ring].tolist())
+
+    def _assign_colours(self, slots):
+        sl = np.array(slots, dtype=np.intp)
+        _, col = self.terrain.sample_points(self._X[sl] / self.tile,
+                                            self._Y[sl] / self.tile)
+        self._CK[sl] = self._colour_keys(np.ascontiguousarray(col, dtype=np.uint8))
+        mc = float(self._COMP[sl].max())
+        if mc > self._max_comp:
+            self._max_comp = mc
+
+    def _seed(self, at):
+        comp = time.monotonic() + self.fade_duration + self._rng.random() * self.fade_jitter
+        s = self._insert(at[0], at[1], 0, comp)
+        self._assign_colours([s])
+
+    def _dart(self, kc, budget):
+        kr2 = self.kernel_r * self.kernel_r
+        pr = self.poisson_r; k = self.dart_k
+        active = self._active; rng = self._rng
+        now = time.monotonic()
+        new_slots = []
+        visits = 0
+        while active and visits < budget:
+            visits += 1
+            ai = int(rng.integers(0, len(active)))
+            i = active[ai]
+            if not self._alive[i]:
+                active[ai] = active[-1]; active.pop(); continue
+            ox = self._X[i]; oy = self._Y[i]; placed = False
+            for _ in range(k):
+                ang = rng.random() * _TWO_PI
+                rad = pr * (1.0 + rng.random())          # r .. 2r
+                x = ox + math.cos(ang) * rad
+                y = oy + math.sin(ang) * rad
+                if (x - kc[0]) ** 2 + (y - kc[1]) ** 2 > kr2:
+                    continue                              # outside the kept disc
+                if self._spacing_ok(x, y):
+                    comp = now + self.fade_duration + rng.random() * self.fade_jitter
+                    new_slots.append(self._insert(x, y, 0, comp))
+                    placed = True
+                    break
+            if not placed:
+                active[ai] = active[-1]; active.pop()     # exhausted -> deactivate
+        if new_slots:
+            self._assign_colours(new_slots)
+        return len(new_slots)
+
+    def _publish(self):
+        idx = np.nonzero(self._alive)[0]
+        pos = np.stack([self._X[idx], self._Y[idx]], axis=1)
+        snap = (pos, self._CK[idx].copy(), self._COMP[idx].copy())
         with self._lock:
-            return sum(d[4] for d in self.dirty)
-
-    # --- worker side ------------------------------------------------------
-    def _splat(self, px, py, colour):
-        r = self.radius
-        for i in range(px.shape[0]):
-            c = colour[i]
-            key = (int(c[0]) & ~7, int(c[1]) & ~7, int(c[2]) & ~7)
-            k = self._kc.get(key)
-            if k is None:
-                k = self.kernel.copy()
-                k.fill((*key, 255), special_flags=pygame.BLEND_RGBA_MULT)
-                self._kc[key] = k
-            self.buffer.blit(k, (px[i] - r, py[i] - r))
-
-    def _stream(self, budget):
-        if not self.dirty:
-            return
-        rb = np.array([(x, y, w, h) for x, y, w, h, _, _ in self.dirty], dtype=float)
-        rem_arr = np.array([d[4] for d in self.dirty], dtype=float)
-        init_arr = np.array([max(1.0, d[5]) for d in self.dirty], dtype=float)
-        areas = rb[:, 2] * rb[:, 3]
-        total = areas.sum()
-        remaining = rem_arr.sum()
-        budget = min(int(budget), int(remaining))
-        if total <= 0 or budget <= 0:
-            if remaining <= 0:
-                self.dirty = []
-            return
-        # oversample, then keep `budget` biased AWAY from the nearest screen edge
-        # (fills in even rings -> soft trailing edge, no corner lag); Gumbel-top-k.
-        n = budget * 4
-        rem_arr = np.array([d[4] for d in self.dirty], dtype=float)
-        frac = np.clip(rem_arr / np.maximum(1.0, self.density * areas), 0.0, 1.0) ** 2
-        cidx = self._rng.choice(len(self.dirty), size=n, p=areas / total)
-        csel = rb[cidx]
-        cpx = csel[:, 0] + self._rng.random(n) * csel[:, 2]
-        cpy = csel[:, 1] + self._rng.random(n) * csel[:, 3]
-        sx = cpx - (self.cam_x - self.buf_ox)
-        sy = cpy - (self.cam_y - self.buf_oy)
-        edge = np.minimum(np.minimum(sx, self.w - sx),
-                          np.minimum(sy, self.h - sy)) / self._edge_norm
-        g = -np.log(-np.log(self._rng.random(n) + 1e-12) + 1e-12)
-        # bias fades as a region fills (frac -> 0) so the final points land
-        # uniformly and the edges catch up to full density -> clean settle.
-        pick = np.argpartition(g + edge * (self.fill_bias * frac[cidx]),
-                               n - budget)[n - budget:]
-        idx = cidx[pick]
-        px = cpx[pick]
-        py = cpy[pick]
-        X = (px + self.buf_ox) / self.tile
-        Y = (py + self.buf_oy) / self.tile
-        for obj in self.objects:
-            if getattr(obj, "covers_screen", False):
-                _, colour = obj.sample_points(X, Y)
-                self._splat(px, py, colour.astype(np.int64))
-                break
-        counts = np.bincount(idx, minlength=len(self.dirty))
-        self.dirty = [(x, y, w, h, rem - int(counts[i]), init)
-                      for i, (x, y, w, h, rem, init) in enumerate(self.dirty)
-                      if rem - int(counts[i]) > 0]
-
-    def _mark(self, rect):
-        x, y, w, h = rect
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.bw, x + w), min(self.bh, y + h)
-        if x1 <= x0 or y1 <= y0:
-            return
-        self.buffer.fill((0, 0, 0, 0), (x0, y0, x1 - x0, y1 - y0))   # back to cloud
-        m = self.radius
-        ex0, ey0 = max(0, x0 - m), max(0, y0 - m)
-        ex1, ey1 = min(self.bw, x1 + m), min(self.bh, y1 + m)
-        # subdivide into small cells so each fills to full density uniformly
-        # (no under-filled fringe); the bias then orders cells, not pixels.
-        c = self.cell
-        cy = ey0
-        while cy < ey1:
-            ch = min(c, ey1 - cy)
-            cx = ex0
-            while cx < ex1:
-                cw = min(c, ex1 - cx)
-                cnt = int(self.density * cw * ch)
-                if cnt > 0:
-                    self.dirty.append((cx, cy, cw, ch, cnt, cnt))
-                cx += c
-            cy += c
-
-    def _recenter(self):
-        wx, wy = self.cam_x - self.buf_ox, self.cam_y - self.buf_oy
-        p = self._prefetch
-        if not (wx < p or wy < p or wx > self.bw - self.w - p or wy > self.bh - self.h - p):
-            return
-        to_ox, to_oy = self.cam_x - self.M, self.cam_y - self.M
-        ddx, ddy = to_ox - self.buf_ox, to_oy - self.buf_oy
-        if abs(ddx) >= self.bw or abs(ddy) >= self.bh:
-            self.buf_ox, self.buf_oy = to_ox, to_oy
-            self.dirty = []
-            self._mark((0, 0, self.bw, self.bh))
-            return
-        self.buffer.scroll(-ddx, -ddy)
-        self.buf_ox, self.buf_oy = to_ox, to_oy
-        shifted = []
-        for bx, by, bw, bh, rem, init in self.dirty:
-            nx, ny = bx - ddx, by - ddy
-            cx0, cy0 = max(0, nx), max(0, ny)
-            cx1, cy1 = min(self.bw, nx + bw), min(self.bh, ny + bh)
-            if cx1 > cx0 and cy1 > cy0:
-                frac = ((cx1 - cx0) * (cy1 - cy0)) / (bw * bh)
-                shifted.append((cx0, cy0, cx1 - cx0, cy1 - cy0,
-                                int(rem * frac), max(1, int(init * frac))))
-        self.dirty = shifted
-        # Expose the newly-revealed L-shape WITHOUT overlapping the two strips:
-        # a shared corner marked twice gets double the point budget and fills at
-        # 2x density, racing ahead of its neighbours (the completed-box trail).
-        if ddx > 0:
-            vx0, vx1 = self.bw - ddx, self.bw
-        elif ddx < 0:
-            vx0, vx1 = 0, -ddx
-        else:
-            vx0 = vx1 = 0
-        if vx1 > vx0:
-            self._mark((vx0, 0, vx1 - vx0, self.bh))         # vertical strip, full height
-        if ddy > 0:
-            hy0, hy1 = self.bh - ddy, self.bh
-        elif ddy < 0:
-            hy0, hy1 = 0, -ddy
-        else:
-            hy0 = hy1 = 0
-        if hy1 > hy0:
-            hx0, hx1 = 0, self.bw                            # horizontal strip,
-            if ddx > 0:
-                hx1 = self.bw - ddx                          # minus the vertical strip's
-            elif ddx < 0:
-                hx0 = -ddx                                   # column (corner already done)
-            if hx1 > hx0:
-                self._mark((hx0, hy0, hx1 - hx0, hy1 - hy0))
+            self._snap = snap
 
     def _work(self):
         while self._running:
-            with self._lock:
-                if not self._init:
-                    self.buf_ox = self.cam_x - self.M
-                    self.buf_oy = self.cam_y - self.M
-                    self.dirty = []
-                    self._mark((0, 0, self.bw, self.bh))
-                    self._init = True
-                else:
-                    self._recenter()
-            if self.dirty:
-                self._stream(BATCH)
+            vc = self._view_center()
+            if self._kc is None:
+                self._kc = vc; self._rearm_kc = vc
+                self._seed(vc)
             else:
-                time.sleep(0.005)
+                kx, ky = self._kc
+                self._kc = (kx + (vc[0] - kx) * self.spring,
+                            ky + (vc[1] - ky) * self.spring)
+            mx = self._kc[0] - self._rearm_kc[0]
+            my = self._kc[1] - self._rearm_kc[1]
+            work = False
+            if mx * mx + my * my > self.poisson_r * self.poisson_r:
+                self._evict(self._kc)
+                self._rearm(self._kc, (mx, my))
+                self._rearm_kc = self._kc
+                work = True
+            if self._active and self._dart(self._kc, 48):
+                work = True
+            if work:
+                self._publish()
+                time.sleep(0)             # yield; short switchinterval keeps main fed
+            else:
+                time.sleep(0.005)         # saturated + stationary -> idle
 
-    # --- main side --------------------------------------------------------
-    def render(self):
-        pass                                  # all generation is on the worker
+    # --- culling (main thread, against the published snapshot) ------------
+    @staticmethod
+    def _colour_keys(cols):
+        cb = cols & 0xF8
+        return ((cb[:, 0].astype(np.uint32) << 16)
+                | (cb[:, 1].astype(np.uint32) << 8)
+                | cb[:, 2].astype(np.uint32))
 
-    def _cloud_background(self, target):
-        size = self.cloud_tex.shape[0]
-        dx, dy = self.cloud_drift
-        s = self.cloud_scale
-        xs = (((np.arange(self.w) + self.cam_x) * s + self.cloud_t * dx).astype(np.int64)) % size
-        ys = (((np.arange(self.h) + self.cam_y) * s + self.cloud_t * dy).astype(np.int64)) % size
-        noise = self.cloud_tex[np.ix_(ys, xs)]
-        billow = np.abs(noise * 2.0 - 1.0)            # abs of signed noise -> bulbous
+    def _cull(self, cam, zoom, x0, y0, x1, y1):
+        P = self._P
+        if P.shape[0] == 0:
+            e = np.zeros(0)
+            return e, e, self._K[:0], self._C[:0]
+        cx = cam[0] + self.w * 0.5
+        cy = cam[1] + self.h * 0.5
+        r = self._scaled_r
+        wx0 = cx + (x0 - r - self.w * 0.5) / zoom
+        wx1 = cx + (x1 + r - self.w * 0.5) / zoom
+        wy0 = cy + (y0 - r - self.h * 0.5) / zoom
+        wy1 = cy + (y1 + r - self.h * 0.5) / zoom
+        m = (P[:, 0] >= wx0) & (P[:, 0] < wx1) & (P[:, 1] >= wy0) & (P[:, 1] < wy1)
+        px = P[m]
+        sx = self.w * 0.5 + (px[:, 0] - cx) * zoom
+        sy = self.h * 0.5 + (px[:, 1] - cy) * zoom
+        return sx, sy, self._K[m], self._C[m]
+
+    # --- draw kernels -----------------------------------------------------
+    def _ensure_kernels(self, zoom):
+        zb = round(zoom, 2)
+        if zb == self._zoom_bucket:
+            return
+        self._zoom_bucket = zb
+        self._scaled_r = max(1, int(round(self.radius * zoom)))
+        self._solid = {}
+        self._fade = {}
+
+    def _blit_settled(self, target, sx, sy, keys, r):
+        cache = self._solid
+        for k in np.unique(keys).tolist():
+            if k not in cache:
+                cache[k] = self._make_solid_kernel(r, k)
+        xs = (sx - r).astype(np.int32).tolist()
+        ys = (sy - r).astype(np.int32).tolist()
+        kers = [cache[k] for k in keys.tolist()]
+        seq = list(zip(kers, zip(xs, ys)))
+        if seq:
+            target.blits(seq, doreturn=False)
+
+    def _make_solid_kernel(self, r, ck):
+        d = r * 2 + 1
+        s = pygame.Surface((d, d))
+        s.fill(_CKEY)
+        pygame.draw.circle(s, (ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF), (r, r), r)
+        try:
+            s = s.convert()
+        except pygame.error:
+            pass
+        s.set_colorkey(_CKEY, pygame.RLEACCEL)
+        return s
+
+    def _blit_fading(self, target, sx, sy, keys, comp, now):
+        prog = np.clip(1.0 - (comp - now) / self.fade_duration, 0.0, 1.0)
+        lv = (prog * self._FADE_LEVELS).astype(np.int32)
+        xs = sx.tolist(); ys = sy.tolist()
+        keys = keys.tolist(); lv = lv.tolist()
+        cache = self._fade
+        for i in range(len(xs)):
+            p = lv[i]
+            if p <= 0:
+                continue
+            ck = keys[i]
+            ent = cache.get((ck, p))
+            if ent is None:
+                ent = self._make_fade_kernel(ck, p)
+                cache[(ck, p)] = ent
+            ker, kr = ent
+            target.blit(ker, (int(xs[i]) - kr, int(ys[i]) - kr))
+
+    def _make_fade_kernel(self, ck, level):
+        frac = level / self._FADE_LEVELS
+        r2 = max(1, int(round(self._scaled_r * frac)))
+        ker = _make_kernel(r2)
+        ker.fill((ck >> 16, (ck >> 8) & 0xFF, ck & 0xFF, int(255 * frac)),
+                 special_flags=pygame.BLEND_RGBA_MULT)
+        return ker, r2
+
+    # --- terrain layer ----------------------------------------------------
+    def _new_layer(self):
+        s = pygame.Surface((self.w, self.h))
+        try:
+            s = s.convert()
+        except pygame.error:
+            pass
+        s.fill(_CKEY)
+        s.set_colorkey(_CKEY)
+        return s
+
+    def _rebuild_layer(self, now, cam, zoom):
+        self._layer.fill(_CKEY)
+        sx, sy, keys, comp = self._cull(cam, zoom, 0, 0, self.w, self.h)
+        settled = now >= comp
+        if settled.any():
+            self._blit_settled(self._layer, sx[settled], sy[settled],
+                               keys[settled], self._scaled_r)
+        self._layer_cam = cam
+        self._layer_zoom = zoom
+
+    def _scroll_layer(self, now, cam, zoom):
+        L = self._layer
+        lcx, lcy = self._layer_cam
+        ddx = int(round((lcx - cam[0]) * zoom))
+        ddy = int(round((lcy - cam[1]) * zoom))
+        if ddx == 0 and ddy == 0:
+            return
+        if abs(ddx) >= self.w or abs(ddy) >= self.h:
+            self._rebuild_layer(now, cam, zoom)
+            return
+        L.scroll(ddx, ddy)
+        self._layer_cam = (lcx - ddx / zoom, lcy - ddy / zoom)
+        lcam = self._layer_cam
+        r = self._scaled_r
+
+        def strip(x0, x1, y0, y1):
+            L.fill(_CKEY, (x0, y0, x1 - x0, y1 - y0))
+            sx, sy, keys, comp = self._cull(lcam, zoom, x0, y0, x1, y1)
+            settled = now >= comp
+            if settled.any():
+                self._blit_settled(L, sx[settled], sy[settled], keys[settled], r)
+
+        if ddx > 0:   strip(0, ddx, 0, self.h)
+        elif ddx < 0: strip(self.w + ddx, self.w, 0, self.h)
+        if ddy > 0:   strip(0, self.w, 0, ddy)
+        elif ddy < 0: strip(0, self.w, self.h + ddy, self.h)
+
+    def _commit_settles(self, now, cam, zoom):
+        if self._prev_now >= self._max_comp:
+            return
+        sx, sy, keys, comp = self._cull(cam, zoom, 0, 0, self.w, self.h)
+        just = (comp > self._prev_now) & (comp <= now)
+        if just.any():
+            self._blit_settled(self._layer, sx[just], sy[just], keys[just], self._scaled_r)
+
+    def _reproject(self, target, cam, zoom):
+        L = self._layer
+        scale = zoom / self._layer_zoom
+        lcx, lcy = self._layer_cam
+        ox = self.w * 0.5 + (lcx - cam[0]) * zoom
+        oy = self.h * 0.5 + (lcy - cam[1]) * zoom
+        sw = max(1, int(round(self.w * scale)))
+        sh = max(1, int(round(self.h * scale)))
+        scaled = pygame.transform.scale(L, (sw, sh))
+        scaled.set_colorkey(_CKEY)
+        target.blit(scaled, (int(ox - sw * 0.5), int(oy - sh * 0.5)))
+
+    # --- cloud ------------------------------------------------------------
+    def _build_cloud_big(self):
+        billow = np.abs(self.cloud_tex * 2.0 - 1.0)
         d = self.cloud_depth
         shade = (255 - (1.0 - billow) * d).astype(np.uint8)
         blue = (255 - (1.0 - billow) * (d * 0.7)).astype(np.uint8)
-        rgb = pygame.surfarray.pixels3d(self._cloud_surf)
+        size = self.cloud_tex.shape[0]
+        surf = pygame.Surface((size, size))
+        rgb = pygame.surfarray.pixels3d(surf)
         rgb[:, :, 0] = shade.T
         rgb[:, :, 1] = shade.T
         rgb[:, :, 2] = blue.T
         del rgb
-        target.blit(self._cloud_surf, (0, 0))
+        B = int(round(size / self.cloud_scale))
+        big = pygame.transform.scale(surf, (B, B))
+        try:
+            big = big.convert()
+        except pygame.error:
+            pass
+        return big, B
 
+    def _cloud_background(self, target, cam_x, cam_y):
+        B = self._cloud_B
+        s = self.cloud_scale
+        dx, dy = self.cloud_drift
+        ox = int(round(cam_x + self.cloud_t * dx / s)) % B
+        oy = int(round(cam_y + self.cloud_t * dy / s)) % B
+        big = self._cloud_big
+        y = -oy
+        while y < self.h:
+            x = -ox
+            while x < self.w:
+                target.blit(big, (x, y))
+                x += B
+            y += B
+
+    # --- frame ------------------------------------------------------------
     def draw(self, target):
+        cam = self._cam
+        zoom = self.zoom
         if self.cloud:
-            self._cloud_background(target)
+            self._cloud_background(target, cam[0], cam[1])
         else:
             target.fill(self.bg)
-        with self._lock:
-            wx, wy = self.cam_x - self.buf_ox, self.cam_y - self.buf_oy
-            sx0, sy0 = max(0, wx), max(0, wy)
-            sx1, sy1 = min(self.bw, wx + self.w), min(self.bh, wy + self.h)
-            if sx1 > sx0 and sy1 > sy0:
-                target.blit(self.buffer, (sx0 - wx, sy0 - wy),
-                            area=pygame.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0))
+
+        with self._lock:                  # grab the latest published snapshot
+            self._P, self._K, self._C = self._snap
+        now = time.monotonic()
+        self._ensure_kernels(zoom)
+
+        if self._layer is None:
+            self._layer = self._new_layer()
+            self._rebuild_layer(now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        elif zoom == self._layer_zoom:
+            self._scroll_layer(now, cam, zoom)
+            self._commit_settles(now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        elif zoom == self._prev_zoom:
+            self._rebuild_layer(now, cam, zoom)
+            target.blit(self._layer, (0, 0))
+        else:
+            self._reproject(target, cam, zoom)
+
+        if now < self._max_comp:          # any point still mid-fade?
+            sx, sy, keys, comp = self._cull(cam, zoom, 0, 0, self.w, self.h)
+            fading = now < comp
+            if fading.any():
+                self._blit_fading(target, sx[fading], sy[fading], keys[fading],
+                                  comp[fading], now)
+
+        self._prev_zoom = zoom
+        self._prev_now = now
         if self.cloud:
             self.cloud_t += 1.0
-
-    def shutdown(self):
-        self._running = False
-        if self._worker is not None:
-            self._worker.join(timeout=1.0)
-            self._worker = None
