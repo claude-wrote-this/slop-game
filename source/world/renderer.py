@@ -182,7 +182,8 @@ class Renderer:
             self._front = []                 # (wx, wy, birth, life, r_px)
             self._front_cache = {}           # (r_px, alpha) -> soft disc surface
             self._front_alpha = 140          # low: many small grains overlap
-            self._front_rate = 110.0         # grains/sec (constant -> steady cost)
+            self._front_white = 180          # target white cover: resolving pts + puffs
+            self._front_fill = 260.0         # max puffs/sec ramp toward the target
             self._front_cap = 120
 
     # --- view API (main thread) -------------------------------------------
@@ -606,17 +607,18 @@ class Renderer:
 
     # --- ephemeral cloud front --------------------------------------------
     def _spawn_front(self, cam, zoom, now, dt):
-        # Drive the front off the sampler's activity: the still-fading points mark
-        # the frontier it's working, and the youngest of them sit on the leading
-        # edge. Spend a *constant* grain budget per second — independent of how many
-        # points are resolving, so the cost is steady and it stays lively whether
-        # the edge is big or small — and scatter it onto those points, weighted to
-        # the youngest. Reads the published position/fade arrays; no sampling.
+        # Keep a constant amount of *white cover* on screen — resolving (fading)
+        # points plus puffs together — by topping the puffs up to fill whatever the
+        # sampler isn't currently covering. So the puff budget runs inverse to the
+        # resolving count: few puffs when lots is resolving (already white), many
+        # when little is (the slow / sharp-edge case). Placement errs outward from
+        # the kernel centre so the cover reaches past the saturated front rather
+        # than leaving it exposed. Reads the published arrays; no sampling.
         puffs = self._front
         if (dt <= 0.0 or now >= self._max_comp        # nothing resolving -> no work
                 or self._P.shape[0] == 0 or len(puffs) >= self._front_cap):
             return
-        fi = np.nonzero(self._C > now)[0]           # fading points (the frontier)
+        fi = np.nonzero(self._C > now)[0]           # resolving (white) points
         if fi.size == 0:
             return
         w, h = self.w, self.h
@@ -625,22 +627,29 @@ class Renderer:
         rx = (P[fi, 0] - cx) * zoom; ry = (P[fi, 1] - cy) * zoom
         on = (rx > -w * 0.5) & (rx < w * 0.5) & (ry > -h * 0.5) & (ry < h * 0.5)
         ci = fi[on]
-        if ci.size == 0:
+        # puffs + resolving points -> a constant white budget
+        target = self._front_white - ci.size
+        target = 0 if target < 0 else min(target, self._front_cap)
+        deficit = target - len(puffs)
+        if deficit <= 0 or ci.size == 0:
             return
+        per_frame = int(self._front_fill * dt) + 1  # ramp, no sudden bursts
+        n = min(deficit, per_frame, self._front_cap - len(puffs))
+
         rng = self._front_rng
-        n = int(self._front_rate * dt + rng.random())    # constant budget
-        n = min(n, self._front_cap - len(puffs))
-        if n <= 0:
-            return
-        youth = np.clip((self._C[ci] - now) / np.maximum(self._D[ci], 1e-6), 0.0, 1.0)
-        wgt = youth * youth + 0.03            # bias to the newest == leading edge
+        kc = self._kc if self._kc is not None else (cx, cy)
+        dcx = P[ci, 0] - kc[0]; dcy = P[ci, 1] - kc[1]
+        dist = np.sqrt(dcx * dcx + dcy * dcy) + 1e-6
+        wgt = (dist / self.kernel_r) ** 2 + 0.02    # err outward, away from centre
         wgt /= wgt.sum()
         pick = rng.choice(ci.size, size=n, p=wgt)
-        jit = self.poisson_r * 0.7
+        jit = self.poisson_r * 0.6
         for j in pick.tolist():
             i = ci[j]
-            wx = P[i, 0] + (rng.random() * 2.0 - 1.0) * jit
-            wy = P[i, 1] + (rng.random() * 2.0 - 1.0) * jit
+            ux = dcx[j] / dist[j]; uy = dcy[j] / dist[j]        # outward unit vector
+            off = self.poisson_r * (0.4 + rng.random() * 1.2)   # push past the point
+            wx = P[i, 0] + ux * off + (rng.random() * 2.0 - 1.0) * jit
+            wy = P[i, 1] + uy * off + (rng.random() * 2.0 - 1.0) * jit
             life = 0.5 + rng.random() * 0.8
             t = rng.random()                         # t^2 -> mostly small grains
             r_px = self.radius * (0.4 + t * t * 1.6)
