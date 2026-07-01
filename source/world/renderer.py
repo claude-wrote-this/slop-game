@@ -161,7 +161,6 @@ class Renderer:
             self.cloud_t = 0.0
             self._cloud_big, self._cloud_B = self._build_cloud_big()
             self._cloud_zrate = 0.0016   # radial-zoom phase per frame (outward flow)
-            self._cloud_pf = 0.25        # parallax: clouds pan opposite to view motion
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
                                int(255 - cloud_depth * 0.7))   # clear-sky fill
             # The radial zoom is scale-heavy, so render it to a half-res buffer (the
@@ -651,17 +650,16 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # Two decoupled references: the zoom PIVOT sits on the kernel's screen
-        # position kpx (so the clouds expand outward from the kernel centre), while
-        # the PAN is opposite the view centre (a parallax — the world slides past).
-        # Anchor = kpx*(1-sc) - view*pf*sc is scale-about-pivot of an un-zoomed
-        # pattern panned by -view*pf: the fixed point of the sc-scaling lands exactly
-        # on kpx for every sc, and the (1-sc) weight means the pivot contributes no
-        # bulk translation at the reference scale — so the clouds pan with the view,
-        # not with the kernel (which only steers where the expansion radiates from).
-        pf = self._cloud_pf
+        # The clouds are LOCKED to the screen: they do not translate as you pan, so
+        # panning the view cancels out and the pattern stays put in screen space.
+        # Their only motion is the radial breathing zoom, which expands outward from
+        # the kernel's projected screen position kpx. Anchor = kpx*(1-sc) + centre*sc
+        # is scale-about-pivot of a screen-fixed pattern: the fixed point of the
+        # per-frame scaling lands on kpx for every sc (so it radiates from the kernel)
+        # and the anchor carries no view term, so nothing translates when the camera
+        # moves — the kernel only steers where the expansion radiates from.
         z = self.zoom
-        vx = cam_x + W * 0.5              # view centre (the "screen") in world
+        vx = cam_x + W * 0.5              # view centre (used only to project kc)
         vy = cam_y + H * 0.5
         kc = self._kc
         kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
@@ -680,8 +678,8 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            ax = kpx * (1.0 - sc) - vx * pf * sc   # scale about kpx; pan opposite view
-            ay = kpy * (1.0 - sc) - vy * pf * sc
+            ax = kpx * (1.0 - sc) + bw * 0.5 * sc   # scale about kpx; screen-locked
+            ay = kpy * (1.0 - sc) + bh * 0.5 * sc
             sx0 = ax - T * math.ceil(ax / T)
             sy0 = ay - T * math.ceil(ay / T)
             y = sy0
