@@ -180,12 +180,25 @@ class Renderer:
                                 int(hb + 0.6 * (255 - hb)))
             self._front_colour = front_colour
             self._front_rng = np.random.default_rng(seed + 12345)
-            self._front = []                 # (wx, wy, birth, life, r_px)
-            self._front_cache = {}           # (r_px, alpha) -> soft disc surface
+            self._front = []                 # (wx, wy, birth, life, r_px, cidx)
+            self._front_cache = {}           # (r_px, alpha, cidx) -> soft disc surface
             self._front_alpha = 255          # grains reach full opacity mid-life
-            self._front_white = 180          # target white cover: resolving pts + puffs
+            self._front_white = 240          # target white cover: resolving pts + puffs
             self._front_fill = 260.0         # max puffs/sec ramp toward the target
-            self._front_cap = 120
+            self._front_cap = 150
+            # palette: subtle blue-white variation (like the cloud bg, but gentler),
+            # indexed by the cloud shade sampled under each puff so it varies the
+            # same way the background does.
+            K = 6
+            if cloud:
+                dd = self.cloud_depth * 0.5
+                self._front_pal = [
+                    (lambda sh: (sh, sh, int(255 - (1.0 - bb) * dd * 0.7)))(
+                        int(255 - (1.0 - bb) * dd))
+                    for bb in (0.55 + 0.45 * k / (K - 1) for k in range(K))]
+            else:
+                self._front_pal = [front_colour] * K
+            self._front_K = K
 
     # --- view API (main thread) -------------------------------------------
     def set_camera(self, x, y):
@@ -496,6 +509,12 @@ class Renderer:
         ker = _make_kernel(r2)
         r = ck >> 16; g = (ck >> 8) & 0xFF; b = ck & 0xFF
         hr, hg, hb = self._haze                       # colour = lerp(haze, terrain, sat)
+        # vary the haze subtly per point (keyed by ck, already in the cache) so new
+        # points read as a gentle blue-white spread rather than a flat white.
+        dv = self.cloud_depth if self.cloud else 0
+        off = (((ck * 2654435761) >> 16) & 0x3f) / 63.0    # 0..1, stable per ck
+        off = (1.0 - off) * dv * 0.3
+        hr = max(0, hr - off); hg = max(0, hg - off); hb = max(0, hb - off * 0.6)
         cr = int(hr + sat * (r - hr))
         cg = int(hg + sat * (g - hg))
         cb = int(hb + sat * (b - hb))
@@ -581,36 +600,46 @@ class Renderer:
         size = tex.shape[0]
         d = self.cloud_depth
         billow = np.abs(tex * 2.0 - 1.0)              # 0 clear .. 1 thick cloud
+        self._cloud_billow = billow                   # for tinting puffs/points
         B = int(round(size / self.cloud_scale))
         big = pygame.Surface((B, B))
-        base = (255 - d, 255 - d, int(255 - d * 0.7))  # clear-sky colour (billow 0)
-        big.fill(base)
-
+        big.fill((255 - d, 255 - d, int(255 - d * 0.7)))   # clear-sky colour (billow 0)
         rng = np.random.default_rng((self.cloud_seed * 2654435761 + 1) & 0xffffffff)
-        g = max(6.0, self.radius * 1.8)               # splat spacing ~ cloud scale
-        nc = max(1, int(round(B / g)))
-        g = B / nc                                     # exact divisor -> seamless wrap
-        rmax = g * 1.7
-        splats = []
-        for iy in range(nc):
-            for ix in range(nc):
-                cx = (ix + 0.5 + (rng.random() - 0.5) * 0.9) * g
-                cy = (iy + 0.5 + (rng.random() - 0.5) * 0.9) * g
-                b = float(billow[int(cy / B * size) % size, int(cx / B * size) % size])
-                shade = int(255 - (1.0 - b) * d)
-                col = (shade, shade, int(255 - (1.0 - b) * d * 0.7))
-                r = int(rmax * (0.55 + 0.65 * b + rng.random() * 0.2))  # bigger where thicker
-                if r >= 1:
-                    splats.append((cx, cy, r, col))
-        rng.shuffle(splats)                            # organic overlap, not fish-scale
-        for cx, cy, r, col in splats:
+
+        def colour(px, py):
+            b = float(billow[int(py / B * size) % size, int(px / B * size) % size])
+            sh = int(255 - (1.0 - b) * d)
+            return (sh, sh, int(255 - (1.0 - b) * d * 0.7))
+
+        def splat(px, py, r, col):
             for ox in (0, -B, B):                      # wrap copies near the edges
-                if abs(cx + ox - B * 0.5) >= B * 0.5 + r:
+                if abs(px + ox - B * 0.5) >= B * 0.5 + r:
                     continue
                 for oy in (0, -B, B):
-                    if abs(cy + oy - B * 0.5) >= B * 0.5 + r:
+                    if abs(py + oy - B * 0.5) >= B * 0.5 + r:
                         continue
-                    pygame.draw.circle(big, col, (int(cx + ox), int(cy + oy)), r)
+                    pygame.draw.circle(big, col, (int(px + ox), int(py + oy)), r)
+
+        g = max(6.0, self.radius * 1.5)
+        nc = max(1, int(round(B / g)))
+        g = B / nc                                     # exact divisor -> seamless wrap
+        # coverage pass: medium discs on a jittered grid so there are never gaps
+        cover = []
+        for iy in range(nc):
+            for ix in range(nc):
+                px = (ix + 0.5 + (rng.random() - 0.5) * 0.8) * g
+                py = (iy + 0.5 + (rng.random() - 0.5) * 0.8) * g
+                cover.append((px, py, int(g * (1.15 + rng.random() * 0.5)), colour(px, py)))
+        rng.shuffle(cover)                             # organic overlap, not fish-scale
+        for px, py, r, col in cover:
+            splat(px, py, r, col)
+        # variety pass: many more discs over a full, small-skewed range of sizes
+        for _ in range(int(nc * nc * 3.0)):
+            px = rng.random() * B; py = rng.random() * B
+            t = rng.random()
+            r = int(g * (0.22 + t * t * 2.3))
+            if r >= 1:
+                splat(px, py, r, colour(px, py))
         try:
             big = big.convert()
         except pygame.error:
@@ -684,7 +713,18 @@ class Renderer:
             wx = P[i, 0] + ux * (off + rad) + tx * tan
             wy = P[i, 1] + uy * (off + rad) + ty * tan
             life = 0.5 + rng.random() * 0.8
-            puffs.append((wx, wy, now, life, self.radius))   # standard point size
+            cidx = self._cloud_tint(wx, wy)             # cloud shade under the puff
+            puffs.append((wx, wy, now, life, self.radius, cidx))
+
+    def _cloud_tint(self, wx, wy):
+        """Palette index from the cloud shade under a world point, so puffs vary
+        the same way the background does. 0 (whitest) when there's no cloud tile."""
+        if not self.cloud:
+            return 0
+        bil = self._cloud_billow; s = bil.shape[0]; B = self._cloud_B
+        b = float(bil[int((wy % B) / B * s) % s, int((wx % B) / B * s) % s])
+        i = int(b * self._front_K)
+        return i if i < self._front_K else self._front_K - 1
 
     def _cloud_front_pass(self, target, cam, zoom, now):
         w, h = self.w, self.h
@@ -696,12 +736,12 @@ class Renderer:
         if not puffs:
             return
         cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
-        fr, fg, fb = self._front_colour
+        pal = self._front_pal
         amax = self._front_alpha
         cache = self._front_cache
         live = []; seq = []
         for p in puffs:
-            wx, wy, birth, life, base_r = p
+            wx, wy, birth, life, base_r, cidx = p
             age = now - birth
             if age >= life:
                 continue                          # dead
@@ -720,11 +760,11 @@ class Renderer:
             alpha = amax if aenv >= 1.0 else (int(amax * aenv) & ~7)  # of its life
             if alpha <= 0:
                 continue
-            key = (r, alpha)
+            key = (r, alpha, cidx)
             surf = cache.get(key)
             if surf is None:
                 surf = _make_kernel(r)
-                surf.fill((fr, fg, fb, alpha), special_flags=pygame.BLEND_RGBA_MULT)
+                surf.fill((*pal[cidx], alpha), special_flags=pygame.BLEND_RGBA_MULT)
                 cache[key] = surf
             seq.append((surf, (int(sx) - r, int(sy) - r)))
         self._front = live
