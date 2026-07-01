@@ -159,6 +159,7 @@ class Renderer:
         self.cloud = cloud
         if cloud:
             self.cloud_tex = _make_cloud_tex(512, cloud_seed)
+            self.cloud_seed = cloud_seed
             self.cloud_scale = cloud_scale
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
@@ -571,19 +572,45 @@ class Renderer:
 
     # --- cloud ------------------------------------------------------------
     def _build_cloud_big(self):
-        billow = np.abs(self.cloud_tex * 2.0 - 1.0)
+        # Assemble the cloud tile from overlapping circular splats — the same look
+        # as the point-cloud foreground — instead of a smooth blur. The fractal
+        # field still sets where the cloud is thick vs clear; a jittered grid of
+        # discs coloured (and sized) by it renders that structure in the point
+        # style. Preprocessed once; the per-frame path is still a tile scroll-blit.
+        tex = self.cloud_tex
+        size = tex.shape[0]
         d = self.cloud_depth
-        shade = (255 - (1.0 - billow) * d).astype(np.uint8)
-        blue = (255 - (1.0 - billow) * (d * 0.7)).astype(np.uint8)
-        size = self.cloud_tex.shape[0]
-        surf = pygame.Surface((size, size))
-        rgb = pygame.surfarray.pixels3d(surf)
-        rgb[:, :, 0] = shade.T
-        rgb[:, :, 1] = shade.T
-        rgb[:, :, 2] = blue.T
-        del rgb
+        billow = np.abs(tex * 2.0 - 1.0)              # 0 clear .. 1 thick cloud
         B = int(round(size / self.cloud_scale))
-        big = pygame.transform.scale(surf, (B, B))
+        big = pygame.Surface((B, B))
+        base = (255 - d, 255 - d, int(255 - d * 0.7))  # clear-sky colour (billow 0)
+        big.fill(base)
+
+        rng = np.random.default_rng((self.cloud_seed * 2654435761 + 1) & 0xffffffff)
+        g = max(6.0, self.radius * 1.8)               # splat spacing ~ cloud scale
+        nc = max(1, int(round(B / g)))
+        g = B / nc                                     # exact divisor -> seamless wrap
+        rmax = g * 1.7
+        splats = []
+        for iy in range(nc):
+            for ix in range(nc):
+                cx = (ix + 0.5 + (rng.random() - 0.5) * 0.9) * g
+                cy = (iy + 0.5 + (rng.random() - 0.5) * 0.9) * g
+                b = float(billow[int(cy / B * size) % size, int(cx / B * size) % size])
+                shade = int(255 - (1.0 - b) * d)
+                col = (shade, shade, int(255 - (1.0 - b) * d * 0.7))
+                r = int(rmax * (0.55 + 0.65 * b + rng.random() * 0.2))  # bigger where thicker
+                if r >= 1:
+                    splats.append((cx, cy, r, col))
+        rng.shuffle(splats)                            # organic overlap, not fish-scale
+        for cx, cy, r, col in splats:
+            for ox in (0, -B, B):                      # wrap copies near the edges
+                if abs(cx + ox - B * 0.5) >= B * 0.5 + r:
+                    continue
+                for oy in (0, -B, B):
+                    if abs(cy + oy - B * 0.5) >= B * 0.5 + r:
+                        continue
+                    pygame.draw.circle(big, col, (int(cx + ox), int(cy + oy)), r)
         try:
             big = big.convert()
         except pygame.error:
