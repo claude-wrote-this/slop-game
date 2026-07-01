@@ -646,9 +646,20 @@ class Renderer:
         # the clouds, far more convincing than a flat horizontal pan. A single zoom
         # would pop when it resets, so two layers run half a phase apart and
         # crossfade (each fades to zero at its own reset), giving a seamless loop.
+        W, H = self.w, self.h
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
+        # Pivot on the kernel centre (where terrain generates), not the screen
+        # centre — the two differ when the view outruns the sampler, and the clouds
+        # should part around the kernel. Project kc to screen, then to buffer coords.
+        kc = self._kc
+        if kc is not None:
+            z = self.zoom
+            pvx = (W * 0.5 + (kc[0] - (cam_x + W * 0.5)) * z) * bw / W
+            pvy = (H * 0.5 + (kc[1] - (cam_y + H * 0.5)) * z) * bh / H
+        else:
+            pvx, pvy = bw * 0.5, bh * 0.5
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
@@ -662,9 +673,9 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            # pin a tile corner to the buffer centre so the zoom pivots on the kernel
-            sx0 = bw * 0.5 - T * math.ceil(bw * 0.5 / T)
-            sy0 = bh * 0.5 - T * math.ceil(bh * 0.5 / T)
+            # pin a tile corner to the kernel pivot so the zoom emanates from there
+            sx0 = pvx - T * math.ceil(pvx / T)
+            sy0 = pvy - T * math.ceil(pvy / T)
             y = sy0
             while y < bh:
                 x = sx0
