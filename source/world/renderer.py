@@ -81,7 +81,7 @@ class Renderer:
                  explore_p=0.04, explore_reach=8.0,
                  seed=0, bg=(15, 17, 21), cloud=True, cloud_scale=0.55,
                  cloud_drift=(0.35, 0.14), cloud_seed=0, cloud_depth=85,
-                 fade_duration=0.6, fade_jitter=0.5):
+                 fade_duration=1.4, fade_jitter=0.5, fade_sat=0.5):
         self.w, self.h = screen_w, screen_h
         self.tile = tile
         self.bg = bg
@@ -96,6 +96,7 @@ class Renderer:
         self.explore_reach = explore_reach    # scout reach, in units of poisson_r
         self.fade_duration = fade_duration
         self.fade_jitter = fade_jitter
+        self.fade_sat = fade_sat              # grow+fade in [0,fade_sat); saturate after
 
         # --- view (main thread writes, worker reads) ---
         self._cam = (0.0, 0.0)        # world top-left of the view
@@ -113,6 +114,8 @@ class Renderer:
         self._kc = None               # kernel center (world), springs to view
         self._rearm_kc = (0.0, 0.0)   # kernel center at the last frontier re-arm
         self._max_comp = 0.0          # latest completion stamped (gates fade path)
+        self._count = 0               # live point count (loading progress)
+        self._saturated = False       # disc filled (active drained) -> loading done
         self._rng = np.random.default_rng(seed)
 
         # --- handoff: the published snapshot main draws from ---
@@ -128,7 +131,7 @@ class Renderer:
         self._scaled_r = self.radius
         self._solid = {}
         self._fade = {}
-        self._FADE_LEVELS = 6
+        self._FADE_LEVELS = 10
 
         # --- terrain layer (screen-size colorkey cache; main thread only) ---
         self._layer = None
@@ -194,10 +197,12 @@ class Renderer:
         self._alive[i] = True
         self._grid.setdefault(self._cell(x, y), []).append(i)
         self._active.append(i)
+        self._count += 1
         return i
 
     def _remove(self, i):
         self._alive[i] = False
+        self._count -= 1
         c = self._cell(self._X[i], self._Y[i])
         lst = self._grid.get(c)
         if lst is not None:
@@ -325,6 +330,8 @@ class Renderer:
                 work = True
             if self._active and self._dart(self._kc, 48):
                 work = True
+            # saturated once the active list has drained over a filled disc
+            self._saturated = (not self._active) and self._count > 0
             if work:
                 self._publish()
                 time.sleep(0)             # yield; short switchinterval keeps main fed
@@ -410,17 +417,20 @@ class Renderer:
             target.blit(ker, (int(xs[i]) - kr, int(ys[i]) - kr))
 
     def _make_fade_kernel(self, ck, level):
+        # Staggered fade in two phases of the progress `frac`:
+        #   [0, fade_sat): a white puff grows (r2) and fades in (alpha)
+        #   [fade_sat, 1]: at full size/opacity it desaturates white -> terrain,
+        # so the edge reads as cloud arriving first, then resolving into ground.
         frac = level / self._FADE_LEVELS
-        r2 = max(1, int(round(self._scaled_r * frac)))
+        grow = min(1.0, frac / self.fade_sat)                    # size + alpha
+        sat = max(0.0, (frac - self.fade_sat) / (1.0 - self.fade_sat))  # colour
+        r2 = max(1, int(round(self._scaled_r * grow)))
         ker = _make_kernel(r2)
-        # A fading point grows (r2), fades in (alpha) AND desaturates from white to
-        # its terrain colour, so the advancing edge reads as hazy cloud resolving
-        # into ground. colour = lerp(white, terrain, frac).
         r = ck >> 16; g = (ck >> 8) & 0xFF; b = ck & 0xFF
-        wr = int(255 - frac * (255 - r))
-        wg = int(255 - frac * (255 - g))
-        wb = int(255 - frac * (255 - b))
-        ker.fill((wr, wg, wb, int(255 * frac)), special_flags=pygame.BLEND_RGBA_MULT)
+        wr = int(255 - sat * (255 - r))
+        wg = int(255 - sat * (255 - g))
+        wb = int(255 - sat * (255 - b))
+        ker.fill((wr, wg, wb, int(255 * grow)), special_flags=pygame.BLEND_RGBA_MULT)
         return ker, r2
 
     # --- terrain layer ----------------------------------------------------

@@ -21,12 +21,14 @@ class GameScene(Scene):
         self.state = state
         self._flash = 0.0
 
-        if world is None:
+        if world is None:                        # fallback build (no loading scene)
+            import time
             from source.world.build import build_world
             job = build_world(state.seed)
             try:
                 while True:
                     next(job)
+                    time.sleep(0.002)            # let the worker thread fill the disc
             except StopIteration as done:
                 world = done.value
 

@@ -8,6 +8,10 @@ from source import config
 from source.world.heightmap import TerrainHeight
 from source.world.renderer import Renderer
 
+# rough saturated-count estimate for the loading bar (Poisson packing ~0.6)
+def _target_points(kernel_r, poisson_r):
+    return max(1, int(0.6 * math.pi * (kernel_r / poisson_r) ** 2))
+
 _REF_DIAG = math.hypot(450, 820)                         # design reference screen
 BASE_POISSON = getattr(config, "RENDER_POISSON_R", 20.0)  # min spacing at reference
 # kernel_r as a fraction of the screen diagonal. zoom_min = 3/(4*factor), so 0.9
@@ -33,5 +37,17 @@ def build_world(seed):
     cam_y = -(config.SCREEN_H // 2)
     renderer.set_camera(cam_x, cam_y)
 
-    yield 1.0, "ready"                               # generation streams in-game
+    # Hold the loading screen until the worker has filled the whole kernel disc,
+    # so the game opens on complete terrain instead of watching it fill in.
+    target = _target_points(kernel_r, poisson_r)
+    stable = 0; last = -1
+    while not renderer._saturated:
+        c = renderer._count
+        stable = stable + 1 if c == last else 0
+        last = c
+        if stable >= 180:                            # ~3s with no growth: safety
+            break
+        yield min(0.95, 0.05 + 0.9 * c / target), "revealing the land"
+
+    yield 1.0, "ready"
     return {"terrain": terrain, "renderer": renderer, "cam": (cam_x, cam_y)}
