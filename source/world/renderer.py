@@ -651,17 +651,22 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The cloud is world-fixed and zoomed about the kernel centre (self._kc): a
-        # texel at cloud-world c sits at (c - kc)*scale from the buffer centre. So the
-        # zoom pivots on the kernel (the tile at c=kc never moves as the scale grows),
-        # and as the kernel travels the projection pans exactly opposite to it — the
-        # clouds don't ride with the kernel, they expand outward from it while the
-        # world slides past. The -kc offset scales with the zoom, which is the bit that
-        # matters: pinned flat it rides along. Driven purely by kc, no camera.
+        # Two decoupled references: the zoom PIVOT sits on the kernel's screen
+        # position kpx (so the clouds expand outward from the kernel centre), while
+        # the PAN is opposite the view centre (a parallax — the world slides past).
+        # Anchor = kpx*(1-sc) - view*pf*sc is scale-about-pivot of an un-zoomed
+        # pattern panned by -view*pf: the fixed point of the sc-scaling lands exactly
+        # on kpx for every sc, and the (1-sc) weight means the pivot contributes no
+        # bulk translation at the reference scale — so the clouds pan with the view,
+        # not with the kernel (which only steers where the expansion radiates from).
         pf = self._cloud_pf
+        z = self.zoom
+        vx = cam_x + W * 0.5              # view centre (the "screen") in world
+        vy = cam_y + H * 0.5
         kc = self._kc
-        kcx = kc[0] if kc is not None else 0.0
-        kcy = kc[1] if kc is not None else 0.0
+        kcx, kcy = (kc[0], kc[1]) if kc is not None else (vx, vy)
+        kpx = (W * 0.5 + (kcx - vx) * z) * bw / W    # kernel projected to the buffer
+        kpy = (H * 0.5 + (kcy - vy) * z) * bh / H
         base = self._cloud_zt; B = self._cloud_zB
         t = self.cloud_t * self._cloud_zrate
         for k in (0.0, 0.5):
@@ -675,8 +680,8 @@ class Renderer:
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            ax = bw * 0.5 - kcx * pf * sc      # kernel pivot; -kc*scale pans opposite
-            ay = bh * 0.5 - kcy * pf * sc
+            ax = kpx * (1.0 - sc) - vx * pf * sc   # scale about kpx; pan opposite view
+            ay = kpy * (1.0 - sc) - vy * pf * sc
             sx0 = ax - T * math.ceil(ax / T)
             sy0 = ay - T * math.ceil(ay / T)
             y = sy0
