@@ -41,6 +41,9 @@ class GameScene(Scene):
         self.zoom_min = 3.0 * diag / (4.0 * self.renderer.kernel_r)
         self.zoom_max = 8.0
         self.zoom = max(self.zoom_min, min(self.zoom_max, 1.0))   # start in range
+        self.zoom_target = self.zoom            # gestures set this; zoom eases toward it
+        self._zoom_focus = None                 # screen point kept fixed while zooming
+        self._zoom_rate = 9.0                   # max zoom change factor per second
         self._drag = None                       # mouse/single-finger pan anchor
         self._fingers = {}                      # finger_id -> (px, py) in pixels
         self._pinch_dist = None                 # last two-finger separation
@@ -87,13 +90,25 @@ class GameScene(Scene):
         return max(self.zoom_min, min(self.zoom_max, z))
 
     def _zoom_at(self, factor, fx, fy):
-        """Scale zoom by `factor` keeping the world point under (fx, fy) fixed."""
-        new = self._clampz(self.zoom * factor)
-        if new == self.zoom:
+        """Aim zoom at `factor`x around (fx, fy); the ease in update() gets there."""
+        self.zoom_target = self._clampz(self.zoom_target * factor)
+        self._zoom_focus = (fx, fy)
+
+    def _ease_zoom(self, dt):
+        """Move zoom toward its target at a bounded rate, keeping the focus point
+        fixed on screen. Rate-limiting spreads a zoom over frames so the renderer
+        can update continuously instead of jumping and popping in on release."""
+        if self._zoom_focus is None or self.zoom == self.zoom_target:
             return
-        wx, wy = self._world_under(fx, fy)
+        max_f = self._zoom_rate ** max(dt, 1e-3)
+        ratio = min(max_f, max(1.0 / max_f, self.zoom_target / self.zoom))
+        new = self._clampz(self.zoom * ratio)
+        fx, fy = self._zoom_focus
+        wx, wy = self._world_under(fx, fy)       # world under the focus, current zoom
         self.zoom = new
-        self._pin(wx, wy, fx, fy)
+        self._pin(wx, wy, fx, fy)                # ...keep it under the focus at new zoom
+        if abs(self.zoom - self.zoom_target) <= self.zoom_target * 1e-3:
+            self.zoom = self.zoom_target
 
     def _pinch_state(self):
         """(separation, midpoint) of the first two active fingers, in pixels."""
@@ -101,14 +116,15 @@ class GameScene(Scene):
         return math.hypot(x1 - x0, y1 - y0), ((x0 + x1) / 2, (y0 + y1) / 2)
 
     def _apply_pinch(self, dist, mid):
-        """One pinned similarity step: scale by the change in finger separation
-        and pin the world point under the previous midpoint to the new midpoint.
-        Folding scale+translation into a single pin keeps it drift-free even
-        though fingers report one at a time."""
+        """Split the two-finger gesture: pan by the midpoint's movement now (so the
+        view tracks the fingers directly), and aim the zoom target at the change in
+        finger separation around the midpoint. update()'s ease drives the zoom, so a
+        fast pinch resolves over a few frames rather than snapping."""
         if self._pinch_dist and self._pinch_mid is not None and dist > 0:
-            wx, wy = self._world_under(*self._pinch_mid)     # world under old mid
-            self.zoom = self._clampz(self.zoom * dist / self._pinch_dist)
-            self._pin(wx, wy, mid[0], mid[1])                # ...to the new mid
+            pmx, pmy = self._pinch_mid
+            self._pan_world(mid[0] - pmx, mid[1] - pmy)      # follow the midpoint
+            self.zoom_target = self._clampz(self.zoom_target * dist / self._pinch_dist)
+            self._zoom_focus = mid
         self._pinch_dist, self._pinch_mid = dist, mid
 
     def handle_event(self, event):
@@ -151,6 +167,7 @@ class GameScene(Scene):
         self.state.tick += 1
         if self._flash > 0:
             self._flash = max(0.0, self._flash - dt)
+        self._ease_zoom(dt)
 
     def draw(self, surface):
         # Main thread: feed the view to the buffer, then draw the cloud + the
