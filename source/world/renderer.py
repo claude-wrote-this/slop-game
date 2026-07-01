@@ -184,9 +184,10 @@ class Renderer:
             self._front_accum = 0.0          # travelled screen px since last spawn
             self._front_pvc = None           # calibrated on the first draw
             self._front_alpha = 205
-            self._front_spacing = max(18.0, self.radius * 1.6)  # px between spawns
+            self._front_dir = None               # smoothed motion / edge normal
+            self._front_spacing = max(12.0, self.radius * 1.1)  # px travelled/spawn
             self._front_size = self.radius * 2.0                # base screen radius
-            self._front_arc = 1.15               # half angular spread along the edge
+            self._front_bins = 18                # columns across the leading edge
             self._front_cap = 90
 
     # --- view API (main thread) -------------------------------------------
@@ -609,6 +610,60 @@ class Renderer:
             y += B
 
     # --- ephemeral cloud front --------------------------------------------
+    def _spawn_front(self, cam, zoom, now, mag):
+        puffs = self._front
+        if (self._front_dir is None or mag <= 1e-6
+                or self._P.shape[0] == 0 or len(puffs) >= self._front_cap):
+            self._front_accum = 0.0
+            return
+        w, h = self.w, self.h
+        rng = self._front_rng
+        dirx, diry = self._front_dir
+        perpx, perpy = -diry, dirx
+        cx = cam[0] + w * 0.5; cy = cam[1] + h * 0.5
+
+        # project every live point; keep the on-screen ones
+        rx = (self._P[:, 0] - cx) * zoom
+        ry = (self._P[:, 1] - cy) * zoom
+        on = (rx > -(w * 0.5 + 30)) & (rx < w * 0.5 + 30) \
+            & (ry > -(h * 0.5 + 30)) & (ry < h * 0.5 + 30)
+        if not on.any():
+            self._front_accum = 0.0
+            return
+        rx = rx[on]; ry = ry[on]
+        u = rx * dirx + ry * diry            # along motion (+ = leading)
+        v = rx * perpx + ry * perpy          # across the front
+        U = 0.5 * (abs(dirx) * w + abs(diry) * h)   # screen half-extent along dir
+        V = 0.5 * (abs(perpx) * w + abs(perpy) * h)
+
+        nb = self._front_bins
+        edges = np.linspace(-V, V, nb + 1)
+        b = np.clip(np.digitize(v, edges) - 1, 0, nb - 1)
+        lead = np.full(nb, -1e18)            # leading-most point per column
+        np.maximum.at(lead, b, u)
+        # columns whose terrain stops short of the screen edge => sharp edge to hide
+        short = np.nonzero((lead > -1e17) & (lead < U - 12.0))[0]
+        if short.size == 0:
+            self._front_accum = 0.0
+            return
+
+        self._front_accum += mag * zoom
+        n_spawn = int(self._front_accum // self._front_spacing)
+        self._front_accum -= n_spawn * self._front_spacing
+        bw = edges[1] - edges[0]
+        for _ in range(min(n_spawn, self._front_cap - len(puffs))):
+            col = int(short[rng.integers(0, short.size)])
+            vv = edges[col] + (0.15 + 0.7 * rng.random()) * bw
+            uu = min(U, lead[col] + rng.random() * self._front_size * 0.7)
+            sx = w * 0.5 + uu * dirx + vv * perpx     # back to screen
+            sy = h * 0.5 + uu * diry + vv * perpy
+            wx = cx + (sx - w * 0.5) / zoom           # anchor in world
+            wy = cy + (sy - h * 0.5) / zoom
+            life = 0.7 + rng.random() * 0.9
+            t = rng.random()                          # t^2 skews the mix toward small
+            r_px = self._front_size * (0.18 + t * t * 1.5)
+            puffs.append((wx, wy, now, life, r_px))
+
     def _cloud_front_pass(self, target, cam, zoom, now):
         w, h = self.w, self.h
         vc = (cam[0] + w * 0.5, cam[1] + h * 0.5)
@@ -621,35 +676,22 @@ class Renderer:
         rng = self._front_rng
         puffs = self._front
 
-        # Spawn on the kernel disc's actual leading edge (kc + dir*kernel_r). When
-        # the view outruns the sampler kc lags behind the view centre, so that edge
-        # crosses onto the screen — the boundary of generated terrain — and the
-        # puffs there veil the pop-in. When generation keeps up kc ~ view centre,
-        # the edge sits off-screen and nothing spawns. One per px travelled.
-        kc = self._kc
-        if kc is not None and mag > 1e-6 and len(puffs) < self._front_cap:
-            ddx = vc[0] - kc[0]; ddy = vc[1] - kc[1]     # kc lags the view by this
-            lag = math.hypot(ddx, ddy)
-            if lag > 1e-6:
-                lead = math.atan2(ddy, ddx)              # toward the leading edge
-                kr = self.kernel_r
-                self._front_accum += mag * zoom
-                while (self._front_accum >= self._front_spacing
-                       and len(puffs) < self._front_cap):
-                    self._front_accum -= self._front_spacing
-                    a = lead + (rng.random() * 2.0 - 1.0) * self._front_arc
-                    wx = kc[0] + math.cos(a) * kr        # a point on the disc edge
-                    wy = kc[1] + math.sin(a) * kr
-                    sx = w * 0.5 + (wx - vc[0]) * zoom    # project to screen
-                    sy = h * 0.5 + (wy - vc[1]) * zoom
-                    if sx < -40 or sx > w + 40 or sy < -40 or sy > h + 40:
-                        continue                          # off-screen slice of arc
-                    life = 0.7 + rng.random() * 0.9
-                    u = rng.random()                      # u^2 skews toward small
-                    r_px = self._front_size * (0.18 + u * u * 1.5)
-                    puffs.append((wx, wy, now, life, r_px))
-        else:
-            self._front_accum = 0.0
+        # Track a smoothed motion direction (the leading edge normal).
+        if mag > 1e-6:
+            d = (dvx / mag, dvy / mag)
+            if self._front_dir is None:
+                self._front_dir = d
+            else:
+                fx, fy = self._front_dir
+                fx += (d[0] - fx) * 0.25; fy += (d[1] - fy) * 0.25
+                n = math.hypot(fx, fy) or 1.0
+                self._front_dir = (fx / n, fy / n)
+
+        # Lay the soft off-white fringe just beyond the terrain's on-screen leading
+        # boundary, but only in the columns where the generated points fall short of
+        # the screen edge — i.e. where the sampler is behind and a sharp saturated
+        # edge is showing. Reads the points' own screen positions; no sampling.
+        self._spawn_front(cam, zoom, now, mag)
 
         if not puffs:
             return
