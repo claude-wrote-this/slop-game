@@ -159,12 +159,11 @@ class Renderer:
             self.cloud_drift = cloud_drift
             self.cloud_depth = cloud_depth
             self.cloud_t = 0.0
-            self._cloud_c_prev = None    # last frame's raw resolved centroid (world)
-            self._cloud_comp = (0.0, 0.0)  # accumulated -(centroid churn) offset
-            self._cloud_piv = None       # spring-smoothed real centroid (zoom pivot)
-            self._cloud_pivk = 0.15      # pivot spring rate per frame (de-jitter)
+            self._cloud_piv = None       # spring-smoothed real centroid (zoom centre)
+            self._cloud_pivk = 0.15      # centre spring rate per frame (de-jitter)
+            self._cloud_layers = None    # [[scale, ox, oy], ...] accumulated zoom state
             self._cloud_big, self._cloud_B = self._build_cloud_big()
-            self._cloud_zrate = 0.0035   # radial-zoom phase per frame (outward flow)
+            self._cloud_zrate = 0.0035   # radial-zoom doublings per frame (outward flow)
             self._cloud_sky = (255 - cloud_depth, 255 - cloud_depth,
                                int(255 - cloud_depth * 0.7))   # clear-sky fill
             # The radial zoom is scale-heavy, so render it to a half-res buffer (the
@@ -654,21 +653,19 @@ class Renderer:
         buf = self._cloud_buf
         bw, bh = buf.get_size()
         buf.fill(self._cloud_sky)             # sky under the crossfading layers
-        # The clouds scroll radially outward from the resolved-points centroid. Two
-        # decoupled references drive it:
-        #   * the ZOOM PIVOT (the fixed point the breathing expands from) follows the
-        #     REAL centroid, so the outward flow always radiates from where the terrain
-        #     is actually resolving and tracks it as you move;
-        #   * the TRANSLATION ANCHOR uses the churn-cancelled centroid, so the texture
-        #     itself does not jitter with the sampler. The raw centroid churns — the
-        #     sampler adds frontier points and evicts trailing ones each re-arm, each
-        #     shift (dx, dy) dragging the texture — so we accumulate the opposite of the
-        #     per-frame centroid delta into _cloud_comp and add it back, cancelling the
-        #     add/evict shifts.
-        # Anchor ax = pivot*(1-sc) + a0*sc is scale-about-pivot: the fixed point of the
-        # sc-scaling lands on the real-centroid pivot, while at the reference scale the
-        # pattern sits at the churn-free anchor a0, so tiles grow (sc 1->2) outward from
-        # the live centroid without the texture juddering as points resolve.
+        # The clouds scroll radially outward from the resolved-points centroid. The
+        # zoom is ACCUMULATED, not recomputed from an absolute pivot: each frame every
+        # layer is nudged by one small zoom step about the current centre. A texel's
+        # offset o thus integrates o <- o*df + centre*(1-df); a moving centre only
+        # changes the next step's direction and can never retroactively translate the
+        # already-accumulated pattern, so when the centre shifts the texture keeps its
+        # place and the outward flow simply resumes from the new centre. (A closed-form
+        # scale-about-pivot instead ties position to the pivot as pivot*(1-sc), so
+        # moving the pivot slides the whole texture — the artefact this replaces.)
+        # The centre is the sprung real centroid; the per-frame step is tiny, so its
+        # jitter and churn are heavily low-passed into the offset. Two layers run half a
+        # doubling apart and crossfade, each halving its scale+offset about the centre at
+        # sc>=2 (hidden while its alpha is ~0), giving a seamless endless zoom.
         z = self.zoom
         vx = cam_x + W * 0.5             # view centre in world
         vy = cam_y + H * 0.5
@@ -676,16 +673,7 @@ class Renderer:
         syw = z * bh / H
         P = self._P
         c = (float(P[:, 0].mean()), float(P[:, 1].mean())) if P.shape[0] else (vx, vy)
-        if self._cloud_c_prev is None:
-            self._cloud_c_prev = c
-        # cancel this frame's centroid churn (both eviction and addition shifts)
-        self._cloud_comp = (self._cloud_comp[0] - (c[0] - self._cloud_c_prev[0]),
-                            self._cloud_comp[1] - (c[1] - self._cloud_c_prev[1]))
-        self._cloud_c_prev = c
-        rcx = c[0] + self._cloud_comp[0]         # churn-cancelled centre (translation)
-        rcy = c[1] + self._cloud_comp[1]
-        # the pivot follows the real centroid, but that centroid jitters on every
-        # add/evict batch; spring it so the zoom point glides instead of twitching.
+        # spring the centroid so the zoom centre glides instead of twitching on churn
         if self._cloud_piv is None:
             self._cloud_piv = c
         else:
@@ -693,29 +681,33 @@ class Renderer:
             self._cloud_piv = (px0 + (c[0] - px0) * self._cloud_pivk,
                                py0 + (c[1] - py0) * self._cloud_pivk)
         pcx, pcy = self._cloud_piv
-        pvx = bw * 0.5 + (pcx - vx) * sxw        # smoothed real centroid -> zoom pivot
+        pvx = bw * 0.5 + (pcx - vx) * sxw        # zoom centre, projected to the buffer
         pvy = bh * 0.5 + (pcy - vy) * syw
-        a0x = bw * 0.5 + (rcx - vx) * sxw        # churn-free centre -> translation anchor
-        a0y = bh * 0.5 + (rcy - vy) * syw
         base = self._cloud_zt; B = self._cloud_zB
-        t = self.cloud_t * self._cloud_zrate
-        for k in (0.0, 0.5):
-            phase = (t + k) % 1.0
+        df = 2.0 ** self._cloud_zrate            # per-frame zoom factor (outward flow)
+        if self._cloud_layers is None:           # seed two layers half a doubling apart
+            self._cloud_layers = [[1.0, pvx, pvy], [math.sqrt(2.0), pvx, pvy]]
+        for layer in self._cloud_layers:
+            sc, ox, oy = layer
+            sc *= df                             # accumulate the zoom about the centre
+            ox = ox * df + pvx * (1.0 - df)
+            oy = oy * df + pvy * (1.0 - df)
+            if sc >= 2.0:                         # seamless reset: halve scale + offset
+                sc *= 0.5
+                ox = pvx + (ox - pvx) * 0.5
+                oy = pvy + (oy - pvy) * 0.5
+            layer[0], layer[1], layer[2] = sc, ox, oy
+            phase = math.log2(sc)                # 0 -> 1 across one doubling
             # boosted so the two layers stay near-opaque through the crossfade (no
             # brightness pulse) while still fading to zero at each layer's reset.
             alpha = min(255, int(357.0 * math.sin(math.pi * phase)))
             if alpha < 4:
                 continue
-            sc = 2.0 ** phase                 # 1 -> 2: texels move away from centre
             T = max(1, int(round(B * sc)))
             scaled = pygame.transform.scale(base, (T, T))
             scaled.set_alpha(alpha)
-            # pivot on the real centroid, translate by the churn-free anchor, then tile
-            # from the lattice point so the pattern expands outward from the live centre.
-            ax = pvx * (1.0 - sc) + a0x * sc
-            ay = pvy * (1.0 - sc) + a0y * sc
-            sx0 = ax - T * math.ceil(ax / T)
-            sy0 = ay - T * math.ceil(ay / T)
+            sx0 = ox - T * math.ceil(ox / T)     # tile from the lattice point at o
+            sy0 = oy - T * math.ceil(oy / T)
             y = sy0
             while y < bh:
                 x = sx0
