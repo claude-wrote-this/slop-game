@@ -1,14 +1,32 @@
-"""Realistic layered terrain — a pure DATA object. No pygame, no renderer, no
-chunks. It answers one question over a block of world cells: sample(ox, oy, cols,
-rows) -> (height, colour).
+"""Layered terrain — a pure DATA object. No pygame, no renderer, no chunks. It
+answers one question over a set of world points: sample_points(X, Y) ->
+(height, colour).
 
-Height is rounded to an integer per cell; rounding IS the layering, one global
-system, not a separate concept. Colour is a per-layer ramp for visibility (a
-placeholder to be replaced). The renderer reads this; the terrain never draws.
+Height model: per-layer 3D occupancy. The world is N layers evenly spaced up from
+z=0. Each layer is an independent solid/empty test at its own z: the 3D fractal
+field is sampled at (x, y, z) and compared against that layer's threshold t(z).
+This yields a full vertical occupancy column — a column can read solid/empty/solid
+down its height, so overhangs and caves fall out naturally. The surface the
+renderer reads is the topmost solid layer per column.
 
-Realism in the continuous field: domain-warped fBm + ridged mountains masked to
-high ground + a redistribution curve. Pure function of world (x, y), so any block
-sampled anywhere tiles seamlessly with its neighbours.
+t(z) rises with height from an always-solid floor: it climbs quickly through the
+low layers and levels off toward the ceiling, so ground is easy to hold low down
+and progressively harder up high. Most land sits low-to-mid and high ground is
+rare and sharp (a realistic hypsometric distribution) rather than the uniform
+slope a linear ramp gives. The `hypso` exponent is the single knob — higher makes
+the early rise steeper, widening the flat lowlands and making peaks rarer/sharper.
+(For this density a convex "slow at the bottom" rise pushes the surface up instead,
+so the curve is deliberately concave to get the stated bias.)
+
+The fractal structure is unchanged from the continuous model — domain-warped
+multi-octave fBm + ridged mountains — carried into the per-layer evaluation. The
+threshold curve controls how much land sits at each height; the fractal/ridge
+structure controls whether high ground forms coherent ranges vs scattered spikes.
+
+Everything is vectorised: the (x, y, z) stack is evaluated at once (z is an added
+axis), then reduced along z to the topmost solid layer before returning. Colour is
+a per-layer ramp for visibility (a deliberate placeholder). Pure function of world
+(x, y, z), so any block sampled anywhere tiles seamlessly with its neighbours.
 """
 import numpy as np
 
@@ -25,11 +43,11 @@ _RAMP_ANCHORS = [(44, 54, 44), (74, 94, 60), (118, 132, 84),
 class TerrainHeight:
     covers_screen = True            # the renderer treats terrain as always on-screen
 
-    def __init__(self, seed, *, layers=12,
+    def __init__(self, seed, *, layers=6,
                  base_freq=0.011, mount_freq=0.03, detail_freq=0.11,
                  warp_freq=0.02, warp_amp=18.0,
-                 octaves=5, redistribution=1.0,
-                 mount_strength=1.15, detail_strength=0.05):
+                 octaves=5, mount_strength=1.15, detail_strength=0.05,
+                 hypso=1.6, z_span=3.5, solid_ceiling=0.55):
         self.noise = _Perlin3(seed)
         self.layers = layers
         self.base_freq = base_freq
@@ -38,10 +56,21 @@ class TerrainHeight:
         self.warp_freq = warp_freq
         self.warp_amp = warp_amp
         self.octaves = octaves
-        self.redistribution = redistribution
         self.mount_strength = mount_strength
         self.detail_strength = detail_strength
+        self.hypso = hypso                    # threshold ease-in exponent (the knob)
+        self.z_span = z_span                  # noise-z spanned over the full height
+        self.solid_ceiling = solid_ceiling    # threshold at the very top layer
         self.colour_ramp = self._build_ramp(layers)
+
+        # Per-layer constants (computed once). frac 0..1 up the stack.
+        frac = np.linspace(0.0, 1.0, layers)
+        self._znoise = (frac * z_span).astype(float)          # noise-z per layer
+        # Concave rise: steep through the low layers, easing toward the ceiling.
+        # Higher hypso -> steeper early -> wider lowlands, rarer peaks.
+        thresh = solid_ceiling * frac ** (1.0 / hypso)
+        thresh[0] = -1.0                                       # z=0 always solid
+        self._thresh = thresh
 
     @staticmethod
     def _build_ramp(layers):
@@ -72,27 +101,40 @@ class TerrainHeight:
             f *= 2.0
         return total / norm
 
-    def continuous(self, X, Y):
-        """Normalised height in [0, 1] at world coords X, Y (arrays)."""
-        X = np.asarray(X, float)
-        Y = np.asarray(Y, float)
-        wx = self._fbm(X, Y, _Z_WARP_X, self.warp_freq, octaves=4)
-        wy = self._fbm(X, Y, _Z_WARP_Y, self.warp_freq, octaves=4)
+    def _density(self, X, Y, Z):
+        """Solidness in [0, 1] of the 3D field at world (X, Y) and noise-z Z.
+        Broadcasts: with X, Y of shape (n, 1) and Z of shape (1, N) it returns the
+        full (n, N) occupancy stack in one shot. Z varies per layer, so the warp
+        and every field vary with height — that vertical variation is what gives
+        overhangs and caves. Same warp+fBm+ridged apparatus as the flat model, only
+        with a live z instead of a fixed decorrelation slice."""
+        wx = self._fbm(X, Y, Z + _Z_WARP_X, self.warp_freq, octaves=4)
+        wy = self._fbm(X, Y, Z + _Z_WARP_Y, self.warp_freq, octaves=4)
         Xw = X + wx * self.warp_amp
         Yw = Y + wy * self.warp_amp
-        base = (self._fbm(Xw, Yw, _Z_BASE, self.base_freq) + 1.0) * 0.5
-        mount = self._ridged(Xw, Yw, _Z_MOUNT, self.mount_freq)
+        base = (self._fbm(Xw, Yw, Z + _Z_BASE, self.base_freq) + 1.0) * 0.5
+        mount = self._ridged(Xw, Yw, Z + _Z_MOUNT, self.mount_freq)
         m = np.clip((base - 0.45) / 0.30, 0.0, 1.0)
-        mount *= m * m * (3.0 - 2.0 * m)
-        detail = (self._fbm(Xw, Yw, _Z_DETAIL, self.detail_freq, octaves=3) + 1.0) * 0.5
-        h = base * 0.7 + mount * self.mount_strength + detail * self.detail_strength
-        h = h / (0.7 + self.mount_strength + self.detail_strength)
-        return np.clip(h, 0.0, 1.0) ** self.redistribution
+        mount *= m * m * (3.0 - 2.0 * m)                      # mountains on high ground
+        detail = (self._fbm(Xw, Yw, Z + _Z_DETAIL, self.detail_freq, octaves=3)
+                  + 1.0) * 0.5
+        d = base * 0.7 + mount * self.mount_strength + detail * self.detail_strength
+        d = d / (0.7 + self.mount_strength + self.detail_strength)
+        return np.clip(d, 0.0, 1.0)
 
     def sample_points(self, X, Y):
         """(height int, colour) at arbitrary world positions X, Y (cell units,
-        fractional ok). No grid — one value per point."""
-        h01 = self.continuous(X, Y)
-        height = np.clip((h01 * self.layers).astype(np.int64), 0, self.layers - 1)
-        colour = self.colour_ramp[height]                    # (..., 3)
+        fractional ok). Height is the topmost solid layer of each column's 3D
+        occupancy — the sub-surface is computed independently even though only the
+        top is returned. No grid — one value per point."""
+        X = np.asarray(X, float); Y = np.asarray(Y, float)
+        shape = X.shape
+        xf = X.reshape(-1)[:, None]                           # (n, 1)
+        yf = Y.reshape(-1)[:, None]
+        d = self._density(xf, yf, self._znoise[None, :])      # (n, N)
+        solid = d > self._thresh[None, :]                     # (n, N), layer 0 always
+        # topmost solid layer per column: first solid scanning from the top down.
+        top = (self.layers - 1) - np.argmax(solid[:, ::-1], axis=1)
+        height = top.reshape(shape).astype(np.int64)
+        colour = self.colour_ramp[height]                     # (..., 3)
         return height, colour
