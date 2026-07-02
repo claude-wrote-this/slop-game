@@ -17,6 +17,8 @@ class MainMenuScene(Scene):
             ("New Game", config.NEW_ICON, self._new, "normal"),
             ("Load Game", config.LOAD_ICON, self._load, "normal"),
             ("Options", config.OPTIONS_ICON, self._options, "normal"),
+            # --- TEMPORARY debug map tool (remove with scenes/debug_map.py) ---
+            ("Debug Map", config.OPTIONS_ICON, self._debug_map, "ghost"),
             ("Quit", config.QUIT_ICON, self.app.quit, "ghost"),
         ]
         self.buttons = [
@@ -35,6 +37,20 @@ class MainMenuScene(Scene):
             
     def _load(self):
         self.app.push(LoadScene(self.app))
+
+    # --- TEMPORARY debug map tool. To remove: delete this method, the "Debug Map"
+    # entry in the button list above, scenes/debug_map.py, and the DEBUG_MAP_* config
+    # block. Samples the terrain to a full-screen bitmap behind the loading screen. ---
+    def _debug_map(self):
+        from source.scenes.loading import LoadingScene
+        from source.scenes.debug_map import debug_map_job, DebugMapScene
+
+        def done(surf):
+            self.app.pop()                                  # drop the loading scene
+            self.app.push(DebugMapScene(self.app, surf))    # menu stays underneath
+
+        self.app.push(LoadingScene(self.app, debug_map_job(),
+                                   on_complete=done, title="Debug Map"))
 
     def _options(self):
         self.app.push(OptionsScene(self.app))

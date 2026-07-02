@@ -37,6 +37,16 @@ TERRAIN_RELIEF_HI = 3.0  # relief at the peak of a mountain range (higher = tall
 TERRAIN_SCALE = 0.06     # noise frequency (smaller = larger landforms)
 TERRAIN_OCTAVES = 4
 
+# --- DEBUG MAP (TEMPORARY, removable) ------------------------------------------
+# Throwaway debug tool for eyeballing the terrain sampler as a flat full-screen
+# bitmap. Delete this block, the "Debug Map" menu button + _debug_map() in
+# scenes/menu.py, and scenes/debug_map.py to remove it entirely. Reuses the
+# terrain params above as-is; only the seed/scale/centre are debug-specific.
+DEBUG_MAP_SEED = 1337            # seed passed to TerrainHeight for the debug map
+DEBUG_MAP_SCALE_X = 8.0          # world units per pixel, x (independent of y)
+DEBUG_MAP_SCALE_Y = 8.0          # world units per pixel, y
+DEBUG_MAP_CENTER = (0.0, 0.0)    # world (x, y) the bitmap is centred on
+
 # --- paths ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAVE_DIR = os.path.join(PROJECT_ROOT, "saves")
