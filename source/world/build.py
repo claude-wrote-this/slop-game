@@ -29,7 +29,8 @@ def build_world(seed):
     poisson_r = BASE_POISSON * s                          # spacing scales -> ~const count
     kernel_r = KERNEL_FACTOR * diag                       # reach scales -> const zoom_min
 
-    terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS)
+    terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS,
+                            layer_dz=config.TERRAIN_LAYER_DZ)
     renderer = Renderer(config.SCREEN_W, config.SCREEN_H, terrain=terrain,
                         tile=tile, seed=seed, poisson_r=poisson_r, kernel_r=kernel_r)
 

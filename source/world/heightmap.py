@@ -53,37 +53,50 @@ _RAMP_ANCHORS = [(18, 46, 24), (40, 82, 42), (72, 120, 64),
 class TerrainHeight:
     covers_screen = True            # the renderer treats terrain as always on-screen
 
-    def __init__(self, seed, *, layers=100,
+    def __init__(self, seed, *, layers=100, layer_dz=0.015,
                  base_freq=0.007, warp_freq=0.02, warp_amp=18.0,
                  octaves=7, erosion=1.0,
-                 hypso=1.6, z_span=1.5, solid_ceiling=0.85):
+                 hypso=1.6, relief=1.5, solid_ceiling=0.85):
         self.noise = _Perlin3(seed)
-        self.layers = layers
+        self.layers = layers                  # ceiling: how many layers can exist
+        self.layer_dz = layer_dz              # fixed noise-z height of one layer
         self.base_freq = base_freq
         self.warp_freq = warp_freq
         self.warp_amp = warp_amp
         self.octaves = octaves
         self.erosion = erosion                # slope-damping strength (0 = plain fBm)
         self.hypso = hypso                    # threshold ease-in exponent (the knob)
-        self.z_span = z_span                  # noise-z spanned over the full height
-        self.solid_ceiling = solid_ceiling    # threshold at the very top layer
-        self.colour_ramp = self._build_ramp(layers)
+        self.relief = relief                  # noise-z where the threshold reaches the ceiling
+        self.solid_ceiling = solid_ceiling    # threshold cap (magnitude iso-level)
 
-        # Per-layer constants (computed once). frac 0..1 up the stack.
-        frac = np.linspace(0.0, 1.0, layers)
-        self._znoise = (frac * z_span).astype(float)          # noise-z per layer
-        # Concave rise: steep through the low layers, easing toward the ceiling.
-        # Higher hypso -> steeper early -> wider lowlands, rarer peaks.
-        thresh = solid_ceiling * frac ** (1.0 / hypso)
-        thresh[0] = -1.0                                       # z=0 always solid
-        self._thresh = thresh
+        # Each layer i is a fixed-height slab at absolute noise-z = i * layer_dz. The
+        # threshold rises with that ACTUAL z (not with i/N), so it tapers the field
+        # into peaks the same way regardless of how many layers exist: a layer is solid
+        # where magnitude(x, y, z) > threshold(z). Because the threshold is anchored to
+        # absolute z, `layers` is a pure ceiling — raise it and the extra slabs are just
+        # empty headroom; flat, low ground leaves every layer above the surface empty.
+        znoise = np.arange(layers, dtype=float) * layer_dz
+        # Concave rise (higher hypso -> wider lowlands, rarer peaks). Anchored so the
+        # threshold hits solid_ceiling at z = relief and keeps climbing above it.
+        thresh = solid_ceiling * (znoise / relief) ** (1.0 / hypso)
+        thresh[0] = -1.0                                       # z=0 always solid (floor)
+        # The magnitude is clipped to [0, 1], so any layer whose threshold is >= 1 can
+        # never be solid. Those slabs still exist (buildable air) but need no sampling,
+        # so the surface search stops there — making a tall ceiling essentially free.
+        nz = int(np.searchsorted(thresh, 1.0))
+        self._nz = max(1, min(layers, nz if nz > 0 else layers))
+        self._znoise = znoise[:self._nz]
+        self._thresh = thresh[:self._nz]
+        self.colour_ramp = self._build_ramp(self._znoise, relief)
 
     @staticmethod
-    def _build_ramp(layers):
+    def _build_ramp(znoise, relief):
+        # Colour by absolute height fraction (z / relief), clamped, so the ramp spans
+        # the real relief band and does not compress when the ceiling is raised.
         xs = np.linspace(0.0, 1.0, len(_RAMP_ANCHORS))
-        ts = np.linspace(0.0, 1.0, layers)
+        ts = np.clip(znoise / relief, 0.0, 1.0)
         chans = [np.interp(ts, xs, [a[c] for a in _RAMP_ANCHORS]) for c in range(3)]
-        return np.stack(chans, axis=1).astype(np.uint8)      # (layers, 3)
+        return np.stack(chans, axis=1).astype(np.uint8)      # (nz, 3)
 
     def _fbm(self, x, y, zslice, freq, octaves):
         """Plain fBm off the gradient noise — used only for the domain warp."""
@@ -105,7 +118,7 @@ class TerrainHeight:
         coarse. Fully vectorised — every layer evaluated at once."""
         px = X * self.base_freq
         py = Y * self.base_freq
-        pz = Z                                    # noise-z (already scaled by z_span)
+        pz = Z                                    # absolute noise-z of each layer (i*dz)
         total = 0.0; norm = 0.0; amp = 1.0
         dx = 0.0; dy = 0.0                         # accumulated horizontal derivative
         for _ in range(self.octaves):
@@ -140,10 +153,10 @@ class TerrainHeight:
         shape = X.shape
         xf = X.reshape(-1)[:, None]                           # (n, 1)
         yf = Y.reshape(-1)[:, None]
-        d = self._density(xf, yf, self._znoise[None, :])      # (n, N) whole stack
-        solid = d > self._thresh[None, :]                     # (n, N), layer 0 always
+        d = self._density(xf, yf, self._znoise[None, :])      # (n, nz) sampled stack
+        solid = d > self._thresh[None, :]                     # (n, nz), layer 0 always
         # topmost solid layer per column: first solid scanning from the top down.
-        top = (self.layers - 1) - np.argmax(solid[:, ::-1], axis=1)
+        top = (self._nz - 1) - np.argmax(solid[:, ::-1], axis=1)
         height = top.reshape(shape).astype(np.int64)
         colour = self.colour_ramp[height]                     # (..., 3)
         return height, colour
