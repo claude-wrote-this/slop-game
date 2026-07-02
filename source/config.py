@@ -43,8 +43,8 @@ TERRAIN_OCTAVES = 4
 # scenes/menu.py, and scenes/debug_map.py to remove it entirely. Reuses the
 # terrain params above as-is; only the seed/scale/centre are debug-specific.
 DEBUG_MAP_SEED = 1337            # seed passed to TerrainHeight for the debug map
-DEBUG_MAP_SCALE_X = 8.0          # world units per pixel, x (independent of y)
-DEBUG_MAP_SCALE_Y = 8.0          # world units per pixel, y
+DEBUG_MAP_SCALE_X = 40.0         # world units per pixel, x (larger = wider area shown)
+DEBUG_MAP_SCALE_Y = 40.0         # world units per pixel, y (independent of x)
 DEBUG_MAP_CENTER = (0.0, 0.0)    # world (x, y) the bitmap is centred on
 DEBUG_MAP_DOWNSAMPLE = 4         # sample 1 of every N pixels, then upscale (N=1 = full res,
                                  # cost ~1/N^2). Bulk sampling is heavy, esp. at high layers.
