@@ -32,6 +32,8 @@ MUTED  = (140, 146, 156)
 TERRAIN_TILE = 16        # px per cell
 TERRAIN_LAYERS = 100     # ceiling: max vertical layers (~a person is a few layers)
 TERRAIN_LAYER_DZ = 0.015 # fixed noise-z height of one layer (slab thickness)
+TERRAIN_RELIEF_LO = 0.7  # relief in the flattest plains (lower = flatter lowlands)
+TERRAIN_RELIEF_HI = 3.0  # relief at the peak of a mountain range (higher = taller peaks)
 TERRAIN_SCALE = 0.06     # noise frequency (smaller = larger landforms)
 TERRAIN_OCTAVES = 4
 

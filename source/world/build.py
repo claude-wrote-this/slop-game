@@ -30,7 +30,9 @@ def build_world(seed):
     kernel_r = KERNEL_FACTOR * diag                       # reach scales -> const zoom_min
 
     terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS,
-                            layer_dz=config.TERRAIN_LAYER_DZ)
+                            layer_dz=config.TERRAIN_LAYER_DZ,
+                            relief_lo=config.TERRAIN_RELIEF_LO,
+                            relief_hi=config.TERRAIN_RELIEF_HI)
     renderer = Renderer(config.SCREEN_W, config.SCREEN_H, terrain=terrain,
                         tile=tile, seed=seed, poisson_r=poisson_r, kernel_r=kernel_r)
 

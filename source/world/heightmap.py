@@ -42,6 +42,8 @@ import numpy as np
 from source.world.field import _Perlin3
 
 _Z_WARP_X, _Z_WARP_Y = 11.5, 23.5
+_Z_RELIEF = 51.5                    # z-slice for the broad highland control map
+_Z_RIDGE = 71.5                     # z-slice for the ridged mountain-spine map
 # per-octave domain rotation (breaks up axis-aligned fBm artefacts)
 _ROT_C, _ROT_S = math.cos(0.5), math.sin(0.5)
 
@@ -55,8 +57,10 @@ class TerrainHeight:
 
     def __init__(self, seed, *, layers=100, layer_dz=0.015,
                  base_freq=0.007, warp_freq=0.02, warp_amp=18.0,
-                 octaves=7, erosion=1.0,
-                 hypso=1.6, relief=1.5, solid_ceiling=0.85):
+                 octaves=7, erosion=1.0, hypso=1.6, solid_ceiling=0.85,
+                 relief_lo=0.7, relief_hi=3.0,
+                 range_freq=0.0012, ridge_freq=0.004,
+                 range_bias=1.6, range_onset=0.4, peak_gain=1.6):
         self.noise = _Perlin3(seed)
         self.layers = layers                  # ceiling: how many layers can exist
         self.layer_dz = layer_dz              # fixed noise-z height of one layer
@@ -66,28 +70,31 @@ class TerrainHeight:
         self.octaves = octaves
         self.erosion = erosion                # slope-damping strength (0 = plain fBm)
         self.hypso = hypso                    # threshold ease-in exponent (the knob)
-        self.relief = relief                  # noise-z where the threshold reaches the ceiling
         self.solid_ceiling = solid_ceiling    # threshold cap (magnitude iso-level)
+        self.relief_lo = relief_lo            # noise-z relief in the flattest plains
+        self.relief_hi = relief_hi            # noise-z relief at the peak of a range
+        self.range_freq = range_freq          # broad highland-map frequency (low = big highlands)
+        self.ridge_freq = ridge_freq          # ridge-map frequency (the mountain spines)
+        self.range_bias = range_bias          # >1 biases highlands to plains (highlands rarer)
+        self.range_onset = range_onset        # highland level at which ridges start to rise
+        self.peak_gain = peak_gain            # how far ridges push relief above the foothills
 
-        # Each layer i is a fixed-height slab at absolute noise-z = i * layer_dz. The
-        # threshold rises with that ACTUAL z (not with i/N), so it tapers the field
-        # into peaks the same way regardless of how many layers exist: a layer is solid
-        # where magnitude(x, y, z) > threshold(z). Because the threshold is anchored to
-        # absolute z, `layers` is a pure ceiling — raise it and the extra slabs are just
-        # empty headroom; flat, low ground leaves every layer above the surface empty.
-        znoise = np.arange(layers, dtype=float) * layer_dz
-        # Concave rise (higher hypso -> wider lowlands, rarer peaks). Anchored so the
-        # threshold hits solid_ceiling at z = relief and keeps climbing above it.
-        thresh = solid_ceiling * (znoise / relief) ** (1.0 / hypso)
-        thresh[0] = -1.0                                       # z=0 always solid (floor)
-        # The magnitude is clipped to [0, 1], so any layer whose threshold is >= 1 can
-        # never be solid. Those slabs still exist (buildable air) but need no sampling,
-        # so the surface search stops there — making a tall ceiling essentially free.
-        nz = int(np.searchsorted(thresh, 1.0))
-        self._nz = max(1, min(layers, nz if nz > 0 else layers))
-        self._znoise = znoise[:self._nz]
-        self._thresh = thresh[:self._nz]
-        self.colour_ramp = self._build_ramp(self._znoise, relief)
+        # Each layer i is a fixed-height slab at absolute noise-z = i * layer_dz, and a
+        # layer is solid where magnitude(x, y, z) > threshold(z). The threshold rises
+        # with ACTUAL z (not i/N) toward solid_ceiling, tapering the field into peaks
+        # the same way regardless of how many layers exist, so `layers` is a pure
+        # ceiling. The z it saturates at is the per-point `relief`, which varies across
+        # the world between relief_lo (plains) and relief_hi (ranges) — see _relief.
+        self._znoise = np.arange(layers, dtype=float) * layer_dz
+        # The magnitude is clipped to [0, 1], so above the z where even the tallest
+        # relief (relief_hi) drives the threshold past 1, nothing is ever solid. Those
+        # slabs still exist as buildable air but need no sampling, so the surface search
+        # stops there — a tall ceiling is essentially free. Plains reach their (lower)
+        # cutoff sooner and just sit empty above it within the shared slab stack.
+        z_top = relief_hi * (1.0 / solid_ceiling) ** hypso
+        self._nz = max(1, min(layers, int(np.ceil(z_top / layer_dz)) + 1))
+        self._znoise = self._znoise[:self._nz]
+        self.colour_ramp = self._build_ramp(self._znoise, relief_hi)
 
     @staticmethod
     def _build_ramp(znoise, relief):
@@ -99,7 +106,7 @@ class TerrainHeight:
         return np.stack(chans, axis=1).astype(np.uint8)      # (nz, 3)
 
     def _fbm(self, x, y, zslice, freq, octaves):
-        """Plain fBm off the gradient noise — used only for the domain warp."""
+        """Plain fBm off the gradient noise — for the domain warp and control maps."""
         total, amp, f, norm = 0.0, 1.0, freq, 0.0
         for _ in range(octaves):
             total = total + self.noise(x * f, y * f, zslice) * amp
@@ -107,6 +114,24 @@ class TerrainHeight:
             amp *= 0.5
             f *= 2.0
         return total / norm
+
+    def _relief(self, X, Y):
+        """Per-point relief — the noise-z the threshold saturates at — from two layered
+        control maps, so mountainousness varies across the world instead of one global
+        steepness. A broad, low-frequency highland map H gives the foothills (biased so
+        plains dominate). A finer ridged map turns its zero-crossings into sharp spines.
+        The ridges are gated into the INTERIOR of highlands (smoothstep from range_onset
+        up), so ranges rise from the centre of the foothills that carry them — but the
+        ridge noise is independent, so a highland only grows mountains where a ridge
+        happens to land; the rest stay rolling hills. Returns [relief_lo, relief_hi]."""
+        H = self._fbm(X, Y, _Z_RELIEF, self.range_freq, octaves=4) * 0.5 + 0.5
+        H = np.clip(H, 0.0, 1.0) ** self.range_bias                  # broad highlands
+        r = self._fbm(X, Y, _Z_RIDGE, self.ridge_freq, octaves=4) * 0.5 + 0.5
+        ridge = 1.0 - np.abs(r * 2.0 - 1.0)                          # ridgelines -> spines
+        g = np.clip((H - self.range_onset) / max(1e-6, 1.0 - self.range_onset), 0.0, 1.0)
+        g = g * g * (3.0 - 2.0 * g)                                  # smoothstep: interior only
+        m = np.clip(H + self.peak_gain * g * ridge, 0.0, 1.0)        # foothills + gated peaks
+        return self.relief_lo + m * (self.relief_hi - self.relief_lo)
 
     def _eroded(self, X, Y, Z):
         """Derivative-damped ("erosion") fBm in ~[0, 1] over the (x, y, z) stack.
@@ -154,7 +179,12 @@ class TerrainHeight:
         xf = X.reshape(-1)[:, None]                           # (n, 1)
         yf = Y.reshape(-1)[:, None]
         d = self._density(xf, yf, self._znoise[None, :])      # (n, nz) sampled stack
-        solid = d > self._thresh[None, :]                     # (n, nz), layer 0 always
+        R = self._relief(xf, yf)                              # (n, 1) per-point relief
+        # threshold rises with absolute z toward solid_ceiling, saturating at each
+        # point's own relief R — so plains taper fast (low peaks), ranges taper slow.
+        thresh = self.solid_ceiling * (self._znoise[None, :] / R) ** (1.0 / self.hypso)
+        thresh[:, 0] = -1.0                                   # z=0 always solid (floor)
+        solid = d > thresh                                    # (n, nz)
         # topmost solid layer per column: first solid scanning from the top down.
         top = (self._nz - 1) - np.argmax(solid[:, ::-1], axis=1)
         height = top.reshape(shape).astype(np.int64)
