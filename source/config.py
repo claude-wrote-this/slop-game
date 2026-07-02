@@ -34,8 +34,9 @@ TERRAIN_LAYERS = 100     # ceiling: max vertical layers (~a person is a few laye
 TERRAIN_LAYER_DZ = 0.015 # fixed noise-z height of one layer (slab thickness)
 TERRAIN_RELIEF_LO = 0.7  # relief in the flattest plains (lower = flatter lowlands)
 TERRAIN_RELIEF_HI = 3.0  # relief at the peak of a mountain range (higher = taller peaks)
-TERRAIN_SCALE = 0.06     # noise frequency (smaller = larger landforms)
-TERRAIN_OCTAVES = 4
+TERRAIN_SCALE_X = 1.0    # terrain size on each axis (coords divided by these before the
+TERRAIN_SCALE_Y = 1.0    # field). Bigger = larger features; equal x/y/z resizes the
+TERRAIN_SCALE_Z = 1.0    # terrain without changing its steepness.
 
 # --- DEBUG MAP (TEMPORARY, removable) ------------------------------------------
 # Throwaway debug tool for eyeballing the terrain sampler as a flat full-screen

@@ -31,6 +31,9 @@ def build_world(seed):
 
     terrain = TerrainHeight(seed, layers=config.TERRAIN_LAYERS,
                             layer_dz=config.TERRAIN_LAYER_DZ,
+                            scale_x=config.TERRAIN_SCALE_X,
+                            scale_y=config.TERRAIN_SCALE_Y,
+                            scale_z=config.TERRAIN_SCALE_Z,
                             relief_lo=config.TERRAIN_RELIEF_LO,
                             relief_hi=config.TERRAIN_RELIEF_HI)
     renderer = Renderer(config.SCREEN_W, config.SCREEN_H, terrain=terrain,

@@ -56,6 +56,7 @@ class TerrainHeight:
     covers_screen = True            # the renderer treats terrain as always on-screen
 
     def __init__(self, seed, *, layers=100, layer_dz=0.015,
+                 scale_x=1.0, scale_y=1.0, scale_z=1.0,
                  base_freq=0.007, warp_freq=0.02, warp_amp=18.0,
                  octaves=7, erosion=1.0, hypso=1.6, solid_ceiling=0.85,
                  relief_lo=0.7, relief_hi=3.0,
@@ -64,6 +65,10 @@ class TerrainHeight:
         self.noise = _Perlin3(seed)
         self.layers = layers                  # ceiling: how many layers can exist
         self.layer_dz = layer_dz              # fixed noise-z height of one layer
+        self.scale_x = scale_x                # terrain size on each axis: bigger = larger
+        self.scale_y = scale_y                # features (coords are divided by these before
+        self.scale_z = scale_z                # the field). Equal x/y/z resizes without
+        #                                       changing steepness (a similarity transform).
         self.base_freq = base_freq
         self.warp_freq = warp_freq
         self.warp_amp = warp_amp
@@ -85,16 +90,18 @@ class TerrainHeight:
         # the same way regardless of how many layers exist, so `layers` is a pure
         # ceiling. The z it saturates at is the per-point `relief`, which varies across
         # the world between relief_lo (plains) and relief_hi (ranges) — see _relief.
-        self._znoise = np.arange(layers, dtype=float) * layer_dz
+        # The z coordinate fed to the field and threshold is the layer height divided
+        # by scale_z, so scale_z stretches the terrain vertically (in step with x/y).
+        zfield = (np.arange(layers, dtype=float) * layer_dz) / scale_z
         # The magnitude is clipped to [0, 1], so above the z where even the tallest
         # relief (relief_hi) drives the threshold past 1, nothing is ever solid. Those
         # slabs still exist as buildable air but need no sampling, so the surface search
         # stops there — a tall ceiling is essentially free. Plains reach their (lower)
         # cutoff sooner and just sit empty above it within the shared slab stack.
-        z_top = relief_hi * (1.0 / solid_ceiling) ** hypso
-        self._nz = max(1, min(layers, int(np.ceil(z_top / layer_dz)) + 1))
-        self._znoise = self._znoise[:self._nz]
-        self.colour_ramp = self._build_ramp(self._znoise, relief_hi)
+        z_top = relief_hi * (1.0 / solid_ceiling) ** hypso          # in zfield units
+        self._nz = max(1, min(layers, int(np.ceil(z_top * scale_z / layer_dz)) + 1))
+        self._zfield = zfield[:self._nz]      # scaled z per layer, for field + threshold
+        self.colour_ramp = self._build_ramp(self._zfield, relief_hi)
 
     @staticmethod
     def _build_ramp(znoise, relief):
@@ -176,13 +183,15 @@ class TerrainHeight:
         returned. No grid — one value per point."""
         X = np.asarray(X, float); Y = np.asarray(Y, float)
         shape = X.shape
-        xf = X.reshape(-1)[:, None]                           # (n, 1)
-        yf = Y.reshape(-1)[:, None]
-        d = self._density(xf, yf, self._znoise[None, :])      # (n, nz) sampled stack
+        # Divide the input coords by the per-axis scale before the field: bigger scale
+        # -> smaller coords -> the noise is zoomed in -> larger terrain features.
+        xf = X.reshape(-1)[:, None] / self.scale_x            # (n, 1)
+        yf = Y.reshape(-1)[:, None] / self.scale_y
+        d = self._density(xf, yf, self._zfield[None, :])      # (n, nz) sampled stack
         R = self._relief(xf, yf)                              # (n, 1) per-point relief
         # threshold rises with absolute z toward solid_ceiling, saturating at each
         # point's own relief R — so plains taper fast (low peaks), ranges taper slow.
-        thresh = self.solid_ceiling * (self._znoise[None, :] / R) ** (1.0 / self.hypso)
+        thresh = self.solid_ceiling * (self._zfield[None, :] / R) ** (1.0 / self.hypso)
         thresh[:, 0] = -1.0                                   # z=0 always solid (floor)
         solid = d > thresh                                    # (n, nz)
         # topmost solid layer per column: first solid scanning from the top down.

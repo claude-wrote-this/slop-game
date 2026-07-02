@@ -41,6 +41,9 @@ def debug_map_job():
     # Same construction as build_world, just with the debug seed and no renderer.
     terrain = TerrainHeight(config.DEBUG_MAP_SEED, layers=config.TERRAIN_LAYERS,
                             layer_dz=config.TERRAIN_LAYER_DZ,
+                            scale_x=config.TERRAIN_SCALE_X,
+                            scale_y=config.TERRAIN_SCALE_Y,
+                            scale_z=config.TERRAIN_SCALE_Z,
                             relief_lo=config.TERRAIN_RELIEF_LO,
                             relief_hi=config.TERRAIN_RELIEF_HI)
 
